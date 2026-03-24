@@ -1,0 +1,7 @@
+dist/
+*.exe
+/qr-tunnel
+node_modules/
+.DS_Store
+tests/screenshots/
+package-lock.json

@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>qr-tunnel SimLab</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>qr-tunnel</h1>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/simlab" class="active">SimLab</a>
+    </nav>
+    <span id="connState" class="state disconnected">Disconnected</span>
+  </header>
+
+  <main>
+    <div class="card full-width">
+      <h2>Network Simulation Controls <span class="sim-tag">SIM</span></h2>
+      <p style="color:#888;font-size:12px;margin-bottom:16px;">
+        Adjust parameters in real-time. Changes take effect immediately.
+      </p>
+      <div class="sim-controls">
+        <div class="card">
+          <h2>QR Parameters</h2>
+          <div class="slider-group">
+            <label>QR Version <span class="val" id="simQRVersionVal">25</span></label>
+            <input type="range" id="simQRVersion" min="1" max="40" value="25"
+                   oninput="document.getElementById('simQRVersionVal').textContent=this.value;sendSimUpdate({qrVersion:+this.value})">
+          </div>
+          <div class="slider-group">
+            <label>FPS <span class="val" id="simFPSVal">15</span></label>
+            <input type="range" id="simFPS" min="1" max="30" value="15"
+                   oninput="document.getElementById('simFPSVal').textContent=this.value;sendSimUpdate({fps:+this.value})">
+          </div>
+          <div class="slider-group">
+            <label>Chunk Size (bytes) <span class="val" id="simChunkSizeVal">800</span></label>
+            <input type="range" id="simChunkSize" min="100" max="2000" step="100" value="800"
+                   oninput="document.getElementById('simChunkSizeVal').textContent=this.value;sendSimUpdate({chunkSize:+this.value})">
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>Degradation Simulation <span class="sim-tag">SIM</span></h2>
+          <div class="slider-group">
+            <label>Frame Drop Rate <span class="val" id="simDropVal">0</span>%</label>
+            <input type="range" id="simDrop" min="0" max="80" step="5" value="0"
+                   oninput="document.getElementById('simDropVal').textContent=this.value;sendSimUpdate({dropRate:+this.value})">
+          </div>
+          <div class="slider-group">
+            <label>Pixel Noise <span class="val" id="simNoiseVal">0</span>%</label>
+            <input type="range" id="simNoise" min="0" max="50" step="5" value="0"
+                   oninput="document.getElementById('simNoiseVal').textContent=this.value;sendSimUpdate({noisePct:+this.value})">
+          </div>
+          <div class="slider-group">
+            <label>Decode Delay <span class="val" id="simDelayVal">0</span>ms</label>
+            <input type="range" id="simDelay" min="0" max="500" step="50" value="0"
+                   oninput="document.getElementById('simDelayVal').textContent=this.value;sendSimUpdate({delayMs:+this.value})">
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h2>Live Decode Rate</h2>
+        <div class="metric-row">
+          <span class="label">Success Rate</span>
+          <span id="decodeOk" class="value big good">0.0%</span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Live Throughput</h2>
+        <div class="metric-row">
+          <span class="label">TX</span>
+          <span id="txRate" class="value big">0.0 KB/s</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">RX</span>
+          <span id="rxRate" class="value big">0.0 KB/s</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card full-width">
+      <h2>Throughput History</h2>
+      <canvas id="throughputChart" width="900" height="200"></canvas>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

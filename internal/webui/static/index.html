@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>qr-tunnel dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>qr-tunnel</h1>
+    <nav>
+      <a href="/" class="active">Dashboard</a>
+      <a href="/simlab">SimLab</a>
+    </nav>
+    <span id="connState" class="state disconnected">Disconnected</span>
+  </header>
+
+  <main>
+    <div class="grid">
+      <div class="card" id="statusCard">
+        <h2>Connection</h2>
+        <div class="metric-row">
+          <span class="label">WebRTC</span>
+          <span id="webrtcState" class="value">--</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">Active Conns</span>
+          <span id="activeConns" class="value">0</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">Streams</span>
+          <span id="activeStreams" class="value">0</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">RTT</span>
+          <span id="rtt" class="value">--</span>
+        </div>
+      </div>
+
+      <div class="card" id="throughputCard">
+        <h2>Throughput</h2>
+        <div class="metric-row">
+          <span class="label">TX</span>
+          <span id="txRate" class="value big">0.0 KB/s</span>
+        </div>
+        <div class="bar-container">
+          <div id="txBar" class="bar tx"></div>
+        </div>
+        <div class="metric-row">
+          <span class="label">RX</span>
+          <span id="rxRate" class="value big">0.0 KB/s</span>
+        </div>
+        <div class="bar-container">
+          <div id="rxBar" class="bar rx"></div>
+        </div>
+      </div>
+
+      <div class="card" id="qrCard">
+        <h2>QR Codec</h2>
+        <div class="metric-row">
+          <span class="label">Encode FPS</span>
+          <span id="encodeFps" class="value">0.0</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">Decode FPS</span>
+          <span id="decodeFps" class="value">0.0</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">Decode OK</span>
+          <span id="decodeOk" class="value">0.0%</span>
+        </div>
+      </div>
+
+      <div class="card" id="paramsCard">
+        <h2>Parameters</h2>
+        <div class="metric-row">
+          <span class="label">QR Version</span>
+          <span id="qrVersion" class="value">25</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">ECC</span>
+          <span id="ecc" class="value">M</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">FPS</span>
+          <span id="fps" class="value">15</span>
+        </div>
+        <div class="metric-row">
+          <span class="label">Chunk Size</span>
+          <span id="chunkSize" class="value">800B</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card full-width" id="chartCard">
+      <h2>Throughput History (60s)</h2>
+      <canvas id="throughputChart" width="900" height="200"></canvas>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

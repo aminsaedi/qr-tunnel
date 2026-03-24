@@ -1,0 +1,15 @@
+{
+  "name": "qr-tunnel-tests",
+  "version": "1.0.0",
+  "description": "E2E tests for qr-tunnel",
+  "scripts": {
+    "test:call": "npx playwright test e2e-call.spec.js --headed",
+    "test:qr": "npx playwright test e2e-qr.spec.js --headed",
+    "test:tunnel": "npx playwright test e2e-tunnel.spec.js --headed",
+    "test:degrade": "npx playwright test e2e-degradation.spec.js --headed",
+    "test:all": "npx playwright test --headed"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}

@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>qr-tunnel test call</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px;
+  }
+  h1 { margin-bottom: 10px; color: #00d4ff; font-size: 1.4em; }
+  .controls {
+    display: flex;
+    gap: 10px;
+    margin: 15px 0;
+    align-items: center;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  button {
+    padding: 10px 24px;
+    border: none;
+    border-radius: 6px;
+    font-size: 14px;
+    cursor: pointer;
+    font-weight: 600;
+    transition: opacity 0.2s;
+  }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  #btnStart { background: #00d4ff; color: #1a1a2e; }
+  #btnAnswer { background: #00ff88; color: #1a1a2e; }
+  #btnHangup { background: #ff4757; color: #fff; }
+  #btnSendTest { background: #a55eea; color: #fff; }
+  select {
+    padding: 8px 12px;
+    border-radius: 6px;
+    border: 1px solid #333;
+    background: #16213e;
+    color: #e0e0e0;
+    font-size: 14px;
+  }
+  .status {
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .status.disconnected { background: #333; color: #999; }
+  .status.connecting { background: #f39c12; color: #1a1a2e; }
+  .status.connected { background: #00ff88; color: #1a1a2e; }
+  .status.failed { background: #ff4757; color: #fff; }
+  .videos {
+    display: flex;
+    gap: 20px;
+    margin-top: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+  .video-box {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .video-box label {
+    margin-bottom: 8px;
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: #888;
+  }
+  canvas.display, video {
+    width: 480px;
+    height: 480px;
+    background: #0f0f23;
+    border: 2px solid #333;
+    border-radius: 8px;
+    object-fit: contain;
+  }
+  .stats {
+    font-size: 11px;
+    color: #666;
+    margin-top: 4px;
+    font-family: monospace;
+  }
+  .log-container {
+    margin-top: 20px;
+    width: 100%;
+    max-width: 980px;
+  }
+  .log-container label {
+    font-size: 12px;
+    color: #666;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  #log {
+    margin-top: 6px;
+    background: #0f0f23;
+    border: 1px solid #333;
+    border-radius: 6px;
+    padding: 12px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 12px;
+    height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    color: #aaa;
+  }
+  .source-select {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+  }
+  .source-select label { font-size: 13px; color: #888; }
+</style>
+</head>
+<body>
+  <h1>qr-tunnel — test video call</h1>
+
+  <div class="controls">
+    <select id="role">
+      <option value="caller">Caller</option>
+      <option value="callee">Callee</option>
+    </select>
+    <div class="source-select">
+      <label>Video source:</label>
+      <select id="videoSource">
+        <option value="canvas">Test Pattern</option>
+        <option value="camera">Camera</option>
+        <option value="screen">Screen Share</option>
+      </select>
+    </div>
+    <button id="btnStart">Start Call</button>
+    <button id="btnAnswer" disabled>Answer</button>
+    <button id="btnHangup" disabled>Hang Up</button>
+    <button id="btnSendTest" disabled>Send Test Frames</button>
+    <span id="status" class="status disconnected">Disconnected</span>
+  </div>
+
+  <div class="videos">
+    <div class="video-box">
+      <label>Local (outgoing)</label>
+      <canvas id="localCanvas" class="display" width="720" height="720"></canvas>
+      <div class="stats" id="localStats">--</div>
+    </div>
+    <div class="video-box">
+      <label>Remote (from Go binary)</label>
+      <canvas id="remoteCanvas" class="display" width="720" height="720"></canvas>
+      <div class="stats" id="remoteStats">--</div>
+    </div>
+  </div>
+
+  <div class="log-container">
+    <label>Signaling Log</label>
+    <div id="log"></div>
+  </div>
+
+  <!-- Hidden canvas for generating test pattern frames -->
+  <canvas id="testPatternCanvas" width="720" height="720" style="display:none;"></canvas>
+
+<script>
+const localCanvas = document.getElementById('localCanvas');
+const remoteCanvas = document.getElementById('remoteCanvas');
+const localCtx = localCanvas.getContext('2d');
+const remoteCtx = remoteCanvas.getContext('2d');
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const localStatsEl = document.getElementById('localStats');
+const remoteStatsEl = document.getElementById('remoteStats');
+const btnStart = document.getElementById('btnStart');
+const btnAnswer = document.getElementById('btnAnswer');
+const btnHangup = document.getElementById('btnHangup');
+const btnSendTest = document.getElementById('btnSendTest');
+const roleSelect = document.getElementById('role');
+const videoSourceSelect = document.getElementById('videoSource');
+const testPatternCanvas = document.getElementById('testPatternCanvas');
+const testPatternCtx = testPatternCanvas.getContext('2d');
+
+let ws = null;
+let pc = null;
+let dataChannel = null;
+let sendInterval = null;
+let framesSent = 0;
+let framesReceived = 0;
+let lastStatTime = Date.now();
+
+function log(msg) {
+  const ts = new Date().toLocaleTimeString();
+  logEl.textContent += `[${ts}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(state, text) {
+  statusEl.className = `status ${state}`;
+  statusEl.textContent = text || state.charAt(0).toUpperCase() + state.slice(1);
+}
+
+// Frame header: [4B seq][2B width][2B height][JPEG data]
+const HEADER_SIZE = 8;
+
+function encodeFrame(canvas, seq) {
+  return new Promise((resolve) => {
+    canvas.toBlob((blob) => {
+      blob.arrayBuffer().then((jpegBuf) => {
+        const header = new ArrayBuffer(HEADER_SIZE);
+        const view = new DataView(header);
+        view.setUint32(0, seq);         // sequence number
+        view.setUint16(4, canvas.width); // width
+        view.setUint16(6, canvas.height);// height
+        const frame = new Uint8Array(HEADER_SIZE + jpegBuf.byteLength);
+        frame.set(new Uint8Array(header), 0);
+        frame.set(new Uint8Array(jpegBuf), HEADER_SIZE);
+        resolve(frame);
+      });
+    }, 'image/jpeg', 0.9);
+  });
+}
+
+function decodeFrame(data) {
+  const view = new DataView(data.buffer || data);
+  const seq = view.getUint32(0);
+  const width = view.getUint16(4);
+  const height = view.getUint16(6);
+  const jpegData = data.slice(HEADER_SIZE);
+  return { seq, width, height, jpegData };
+}
+
+function renderFrame(frame, canvas, ctx) {
+  const blob = new Blob([frame.jpegData], { type: 'image/jpeg' });
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  img.onload = () => {
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    URL.revokeObjectURL(url);
+  };
+  img.src = url;
+}
+
+// Generate a scrolling test pattern
+let patternFrame = 0;
+function drawTestPattern() {
+  patternFrame++;
+  const ctx = testPatternCtx;
+  const W = 720, H = 720;
+
+  ctx.fillStyle = '#1a1a2e';
+  ctx.fillRect(0, 0, W, H);
+
+  const colors = ['#ff4757', '#ff6348', '#ffa502', '#2ed573', '#1e90ff', '#5352ed', '#a55eea'];
+  const barHeight = 100;
+  for (let i = 0; i < colors.length; i++) {
+    const y = ((i * barHeight + patternFrame * 2) % (H + barHeight)) - barHeight;
+    ctx.fillStyle = colors[i];
+    ctx.fillRect(0, y, W, barHeight - 4);
+  }
+
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 48px monospace';
+  ctx.textAlign = 'center';
+  ctx.fillText(`Frame ${patternFrame}`, W/2, H/2);
+  ctx.font = '24px monospace';
+  ctx.fillText(new Date().toLocaleTimeString(), W/2, H/2 + 50);
+  ctx.font = '18px monospace';
+  ctx.fillText('Browser Test Pattern', W/2, H/2 + 90);
+
+  // Copy to local display
+  localCtx.drawImage(testPatternCanvas, 0, 0);
+}
+
+// Update stats display
+setInterval(() => {
+  const now = Date.now();
+  const elapsed = (now - lastStatTime) / 1000;
+  if (elapsed > 0) {
+    localStatsEl.textContent = `TX: ${framesSent} frames (${(framesSent / elapsed).toFixed(1)} fps)`;
+    remoteStatsEl.textContent = `RX: ${framesReceived} frames (${(framesReceived / elapsed).toFixed(1)} fps)`;
+  }
+}, 1000);
+
+function connectSignaling() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}`);
+
+  ws.onopen = () => log('signaling: connected');
+
+  ws.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    log(`signaling: received ${msg.type}`);
+
+    switch (msg.type) {
+      case 'welcome':
+        log(`signaling: I am peer ${msg.peerIndex}, ${msg.peersConnected} peers total`);
+        break;
+
+      case 'peer-joined':
+        log(`signaling: peer joined (${msg.peersConnected} peers)`);
+        break;
+
+      case 'peer-left':
+        log('signaling: peer left');
+        setStatus('disconnected', 'Peer Left');
+        cleanup();
+        break;
+
+      case 'offer':
+        log('signaling: received offer');
+        if (!pc) createPeerConnection();
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        btnAnswer.disabled = false;
+        setStatus('connecting', 'Incoming Call');
+        break;
+
+      case 'answer':
+        log('signaling: received answer');
+        if (pc) await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        break;
+
+      case 'ice':
+        if (pc && msg.payload) {
+          try {
+            await pc.addIceCandidate(new RTCIceCandidate(msg.payload));
+          } catch(e) {
+            log(`signaling: ICE error: ${e.message}`);
+          }
+        }
+        break;
+    }
+  };
+
+  ws.onclose = () => { log('signaling: disconnected'); setStatus('disconnected'); };
+  ws.onerror = () => log('signaling: error');
+}
+
+function setupDataChannel(dc) {
+  dataChannel = dc;
+  dc.binaryType = 'arraybuffer';
+
+  dc.onopen = () => {
+    log(`datachannel: '${dc.label}' opened`);
+    btnSendTest.disabled = false;
+  };
+
+  dc.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer && event.data.byteLength > HEADER_SIZE) {
+      framesReceived++;
+      const frame = decodeFrame(new Uint8Array(event.data));
+      renderFrame(frame, remoteCanvas, remoteCtx);
+    }
+  };
+
+  dc.onclose = () => {
+    log(`datachannel: '${dc.label}' closed`);
+    btnSendTest.disabled = true;
+  };
+}
+
+function createPeerConnection() {
+  pc = new RTCPeerConnection({
+    iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
+  });
+
+  pc.onicecandidate = (event) => {
+    if (event.candidate) {
+      ws.send(JSON.stringify({ type: 'ice', payload: event.candidate }));
+    }
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    log(`webrtc: ICE state -> ${pc.iceConnectionState}`);
+    switch (pc.iceConnectionState) {
+      case 'checking': setStatus('connecting', 'Connecting...'); break;
+      case 'connected':
+      case 'completed': setStatus('connected', 'Connected'); break;
+      case 'failed': setStatus('failed', 'Failed'); break;
+      case 'disconnected':
+      case 'closed': setStatus('disconnected', 'Disconnected'); break;
+    }
+  };
+
+  // Handle incoming DataChannels (when Go binary is caller)
+  pc.ondatachannel = (event) => {
+    log(`webrtc: received data channel '${event.channel.label}'`);
+    if (event.channel.label === 'frames') {
+      setupDataChannel(event.channel);
+    }
+  };
+
+  // Also handle media tracks (for browser↔browser testing)
+  pc.ontrack = (event) => {
+    log(`webrtc: received remote track (${event.track.kind})`);
+  };
+}
+
+// --- Button handlers ---
+
+btnStart.addEventListener('click', async () => {
+  try {
+    createPeerConnection();
+
+    // Create the DataChannel for frame exchange
+    const dc = pc.createDataChannel('frames');
+    setupDataChannel(dc);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    ws.send(JSON.stringify({ type: 'offer', payload: offer }));
+    log('signaling: sent offer');
+
+    btnStart.disabled = true;
+    btnHangup.disabled = false;
+    setStatus('connecting', 'Calling...');
+  } catch (err) {
+    log(`error: ${err.message}`);
+  }
+});
+
+btnAnswer.addEventListener('click', async () => {
+  try {
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    ws.send(JSON.stringify({ type: 'answer', payload: answer }));
+    log('signaling: sent answer');
+
+    btnAnswer.disabled = true;
+    btnHangup.disabled = false;
+  } catch (err) {
+    log(`error: ${err.message}`);
+  }
+});
+
+btnSendTest.addEventListener('click', () => {
+  if (sendInterval) {
+    clearInterval(sendInterval);
+    sendInterval = null;
+    btnSendTest.textContent = 'Send Test Frames';
+    log('stopped sending test frames');
+    return;
+  }
+
+  log('sending test frames at 15fps...');
+  btnSendTest.textContent = 'Stop Sending';
+  let seq = 0;
+
+  sendInterval = setInterval(async () => {
+    if (!dataChannel || dataChannel.readyState !== 'open') return;
+
+    drawTestPattern();
+    seq++;
+    const frameData = await encodeFrame(testPatternCanvas, seq);
+    try {
+      dataChannel.send(frameData);
+      framesSent++;
+    } catch(e) {
+      log(`send error: ${e.message}`);
+    }
+  }, 1000 / 15);
+});
+
+btnHangup.addEventListener('click', () => {
+  cleanup();
+  setStatus('disconnected');
+  log('call: hung up');
+});
+
+function cleanup() {
+  if (sendInterval) { clearInterval(sendInterval); sendInterval = null; }
+  if (dataChannel) { dataChannel.close(); dataChannel = null; }
+  if (pc) { pc.close(); pc = null; }
+  btnStart.disabled = false;
+  btnAnswer.disabled = true;
+  btnHangup.disabled = true;
+  btnSendTest.disabled = true;
+  btnSendTest.textContent = 'Send Test Frames';
+}
+
+// Auto-connect to signaling
+connectSignaling();
+</script>
+</body>
+</html>

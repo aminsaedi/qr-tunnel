@@ -1,0 +1,191 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Mono', 'Fira Code', monospace;
+  background: #0f0f23;
+  color: #ccc;
+  min-height: 100vh;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 16px 24px;
+  background: #16213e;
+  border-bottom: 1px solid #1a1a3e;
+}
+
+header h1 {
+  color: #00d4ff;
+  font-size: 1.2em;
+  font-weight: 700;
+}
+
+header nav {
+  display: flex;
+  gap: 8px;
+}
+
+header nav a {
+  color: #666;
+  text-decoration: none;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 13px;
+  transition: all 0.2s;
+}
+
+header nav a:hover { color: #aaa; background: #1a1a3e; }
+header nav a.active { color: #00d4ff; background: #1a1a3e; }
+
+.state {
+  margin-left: auto;
+  padding: 6px 14px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.state.connected { background: #00ff88; color: #0f0f23; }
+.state.connecting { background: #f39c12; color: #0f0f23; }
+.state.disconnected { background: #333; color: #888; }
+.state.failed { background: #ff4757; color: #fff; }
+
+main {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px;
+  margin-bottom: 16px;
+}
+
+.card {
+  background: #16213e;
+  border: 1px solid #1a1a3e;
+  border-radius: 10px;
+  padding: 18px;
+}
+
+.card.full-width {
+  grid-column: 1 / -1;
+}
+
+.card h2 {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  color: #555;
+  margin-bottom: 14px;
+}
+
+.metric-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 0;
+}
+
+.label {
+  color: #888;
+  font-size: 13px;
+}
+
+.value {
+  color: #e0e0e0;
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.value.big {
+  font-size: 18px;
+  color: #00d4ff;
+}
+
+.value.good { color: #00ff88; }
+.value.warn { color: #f39c12; }
+.value.bad { color: #ff4757; }
+
+.bar-container {
+  width: 100%;
+  height: 6px;
+  background: #0f0f23;
+  border-radius: 3px;
+  margin: 4px 0 12px;
+  overflow: hidden;
+}
+
+.bar {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+  width: 0%;
+}
+
+.bar.tx { background: #00d4ff; }
+.bar.rx { background: #00ff88; }
+
+canvas {
+  width: 100%;
+  height: 200px;
+  display: block;
+}
+
+/* SimLab page */
+.sim-controls {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.slider-group {
+  padding: 12px 0;
+}
+
+.slider-group label {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  font-size: 13px;
+}
+
+.slider-group label .val {
+  color: #00d4ff;
+  font-weight: 600;
+}
+
+input[type="range"] {
+  width: 100%;
+  height: 6px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: #0f0f23;
+  border-radius: 3px;
+  outline: none;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #00d4ff;
+  cursor: pointer;
+}
+
+.sim-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  background: #f39c12;
+  color: #0f0f23;
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 6px;
+}
