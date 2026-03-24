@@ -5,10 +5,10 @@ go 1.25.5
 require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
+	github.com/coder/websocket v1.8.14
 	github.com/makiuchi-d/gozxing v0.1.1
 	github.com/pion/webrtc/v3 v3.3.6
 	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
-	nhooyr.io/websocket v1.8.17
 )
 
 require (

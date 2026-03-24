@@ -7,7 +7,7 @@ import (
 	"log"
 	"sync"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // SignalingMessage represents a signaling message exchanged between peers.
