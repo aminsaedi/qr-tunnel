@@ -31,6 +31,7 @@ type WebRTCProvider struct {
 	seq       uint32
 	mu        sync.Mutex
 	localSDP  string
+	offerSent bool
 	ctx       context.Context
 	cancel    context.CancelFunc
 }
@@ -44,13 +45,7 @@ func NewWebRTCProvider() *WebRTCProvider {
 func (p *WebRTCProvider) Connect(signalingURL string, opts provider.CallOptions) error {
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 
-	// Connect to signaling server
-	p.signaling = NewSignalingClient(signalingURL)
-	if err := p.signaling.Connect(p.ctx); err != nil {
-		return fmt.Errorf("signaling: %w", err)
-	}
-
-	// Create PeerConnection
+	// Create PeerConnection FIRST (before signaling connect to avoid race)
 	config := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
@@ -61,21 +56,6 @@ func (p *WebRTCProvider) Connect(signalingURL string, opts provider.CallOptions)
 		return fmt.Errorf("create peer connection: %w", err)
 	}
 	p.pc = pc
-
-	// Track connection state
-	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("[webrtc] ICE state: %s", state.String())
-		switch state {
-		case webrtc.ICEConnectionStateChecking:
-			p.setState(provider.StateConnecting)
-		case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted:
-			p.setState(provider.StateConnected)
-		case webrtc.ICEConnectionStateFailed:
-			p.setState(provider.StateFailed)
-		case webrtc.ICEConnectionStateDisconnected, webrtc.ICEConnectionStateClosed:
-			p.setState(provider.StateDisconnected)
-		}
-	})
 
 	// Handle incoming DataChannels (callee side)
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
@@ -97,12 +77,47 @@ func (p *WebRTCProvider) Connect(signalingURL string, opts provider.CallOptions)
 		}
 	})
 
-	// Handle signaling messages
+	// Channel to signal when ICE connects
 	connected := make(chan struct{}, 1)
+
+	// Track connection state (single handler — pion overwrites on duplicate registration)
+	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
+		log.Printf("[webrtc] ICE state: %s", state.String())
+		switch state {
+		case webrtc.ICEConnectionStateChecking:
+			p.setState(provider.StateConnecting)
+		case webrtc.ICEConnectionStateConnected, webrtc.ICEConnectionStateCompleted:
+			p.setState(provider.StateConnected)
+			select {
+			case connected <- struct{}{}:
+			default:
+			}
+		case webrtc.ICEConnectionStateFailed:
+			p.setState(provider.StateFailed)
+		case webrtc.ICEConnectionStateDisconnected, webrtc.ICEConnectionStateClosed:
+			p.setState(provider.StateDisconnected)
+		}
+	})
+
+	// If caller, create the DataChannel before connecting to signaling
+	if opts.Role == "caller" {
+		dc, err := pc.CreateDataChannel("frames", &webrtc.DataChannelInit{})
+		if err != nil {
+			return fmt.Errorf("create data channel: %w", err)
+		}
+		p.setupDataChannel(dc)
+	}
+
+	// Set up signaling message handler BEFORE connecting (to avoid missing welcome)
+	p.signaling = NewSignalingClient(signalingURL)
 	p.signaling.OnMessage(func(msg SignalingMessage) {
 		switch msg.Type {
 		case "welcome":
 			log.Printf("[signaling] welcome: peer %d, %d connected", msg.PeerIndex, msg.PeersConnected)
+			// If caller and the other peer is already connected, send offer now
+			if opts.Role == "caller" && msg.PeersConnected >= 2 {
+				go p.createAndSendOffer()
+			}
 		case "peer-joined":
 			log.Printf("[signaling] peer joined (%d total)", msg.PeersConnected)
 			// If caller role and peer just joined, create offer
@@ -123,28 +138,12 @@ func (p *WebRTCProvider) Connect(signalingURL string, opts provider.CallOptions)
 
 	p.setState(provider.StateConnecting)
 
-	// If caller, create the DataChannel and offer
-	if opts.Role == "caller" {
-		dc, err := pc.CreateDataChannel("frames", &webrtc.DataChannelInit{})
-		if err != nil {
-			return fmt.Errorf("create data channel: %w", err)
-		}
-		p.setupDataChannel(dc)
-		// Don't send offer yet — wait for peer-joined signal
+	// NOW connect to signaling (handler is already registered, so welcome won't be missed)
+	if err := p.signaling.Connect(p.ctx); err != nil {
+		return fmt.Errorf("signaling: %w", err)
 	}
 
 	// Wait for connection or timeout
-	go func() {
-		pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-			if state == webrtc.ICEConnectionStateConnected || state == webrtc.ICEConnectionStateCompleted {
-				select {
-				case connected <- struct{}{}:
-				default:
-				}
-			}
-		})
-	}()
-
 	select {
 	case <-connected:
 		log.Printf("[webrtc] connected!")
@@ -158,6 +157,14 @@ func (p *WebRTCProvider) Connect(signalingURL string, opts provider.CallOptions)
 }
 
 func (p *WebRTCProvider) createAndSendOffer() {
+	p.mu.Lock()
+	if p.offerSent {
+		p.mu.Unlock()
+		return
+	}
+	p.offerSent = true
+	p.mu.Unlock()
+
 	offer, err := p.pc.CreateOffer(nil)
 	if err != nil {
 		log.Printf("[webrtc] create offer error: %v", err)

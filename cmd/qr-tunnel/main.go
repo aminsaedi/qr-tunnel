@@ -236,8 +236,13 @@ func runConnect(args []string) {
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Printf("qr-tunnel %s — connect mode", Version)
 
+	// Initialize metrics for web UI
+	metrics := tui.NewMetricsSource()
+	metrics.SignalingURL.Store(cf.signaling)
+
 	p := webrtcProvider.NewWebRTCProvider()
 	p.OnState(func(state provider.State) {
+		metrics.WebRTCState.Store(state.String())
 		log.Printf("[state] %s", state)
 	})
 
@@ -248,6 +253,16 @@ func runConnect(args []string) {
 			log.Printf("[rx] frame #%d (%dx%d)", frameCount, f.Width, f.Height)
 		}
 	})
+
+	// Start web UI BEFORE connect (connect can block waiting for peer)
+	if cf.gui != "" {
+		webServer := webui.NewServer(metrics)
+		if err := webServer.Start(cf.gui); err != nil {
+			log.Fatalf("webui start failed: %v", err)
+		}
+		defer webServer.Close()
+		log.Printf("[webui] serving on http://%s", cf.gui)
+	}
 
 	log.Printf("connecting to %s as %s...", cf.signaling, cf.role)
 	if err := p.Connect(cf.signaling, provider.CallOptions{Role: cf.role}); err != nil {

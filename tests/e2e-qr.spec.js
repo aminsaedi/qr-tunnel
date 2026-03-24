@@ -1,69 +1,85 @@
 const { test, expect } = require('@playwright/test');
-const { startSignaling, startTunnel, waitForOutput, killProc } = require('./helpers');
+const { execSync } = require('child_process');
+const { startSignaling, startTunnel, waitForOutput, killProc, sleep, ROOT } = require('./helpers');
 
-let signaling;
-let tunnel;
+const SIGNALING_PORT_1 = 4003;
+const SIGNALING_PORT_2 = 4004;
 
-test.beforeEach(async () => {
-  const { execSync } = require('child_process');
-  execSync('go build -o qr-tunnel ./cmd/qr-tunnel', { cwd: require('./helpers').ROOT });
+test.beforeAll(async () => {
+  execSync('go build -o qr-tunnel ./cmd/qr-tunnel', { cwd: ROOT, stdio: 'inherit' });
 });
 
-test.afterEach(async () => {
-  killProc(tunnel);
-  killProc(signaling);
-});
+test.describe.serial('QR frame exchange', () => {
+  let signaling;
+  let tunnel;
 
-test('Go binary sends QR frames visible in browser', async ({ page }) => {
-  signaling = await startSignaling(3003);
+  test.afterEach(async () => {
+    killProc(tunnel);
+    killProc(signaling);
+    tunnel = null;
+    signaling = null;
+    await sleep(500);
+  });
 
-  // Start Go binary as callee with test frames
-  tunnel = startTunnel('connect', ['--role', 'callee', '--test-frames'], 3003);
-  await new Promise(r => setTimeout(r, 2000));
+  test('Go binary sends QR frames visible in browser', async ({ page }) => {
+    signaling = await startSignaling(SIGNALING_PORT_1);
 
-  // Open browser as caller
-  await page.goto('http://localhost:3003');
-  await page.selectOption('#role', 'caller');
-  await page.click('#btnStart');
+    // Start Go binary as callee with test frames enabled
+    tunnel = startTunnel('connect', ['--role', 'callee', '--test-frames'], SIGNALING_PORT_1);
+    await waitForOutput(tunnel, 'connecting', 10000);
+    await sleep(1500);
 
-  // Wait for connection
-  await expect(page.locator('#status')).toHaveText(/Connected/, { timeout: 15000 });
+    // Open browser as caller
+    await page.goto(`http://localhost:${SIGNALING_PORT_1}`);
+    await page.selectOption('#role', 'caller');
+    await page.click('#btnStart');
 
-  // Wait for frames to arrive
-  await new Promise(r => setTimeout(r, 5000));
+    // Wait for connection
+    await expect(page.locator('#status')).toHaveText(/Connected/, { timeout: 20000 });
 
-  // Check remote stats for received frames
-  const stats = await page.locator('#remoteStats').textContent();
-  console.log('Remote stats:', stats);
+    // Wait for frames to flow
+    await sleep(5000);
 
-  await page.screenshot({ path: 'screenshots/03-qr-frames.png' });
-});
+    // Check remote stats — browser should have received frames from Go binary
+    const stats = await page.locator('#remoteStats').textContent();
+    console.log('Browser remote stats:', stats);
 
-test('Browser sends frames that Go binary receives', async ({ page }) => {
-  signaling = await startSignaling(3004);
+    // Check Go binary logs for frame sending
+    const output = tunnel.getOutput();
+    console.log('--- Go binary output (truncated) ---');
+    console.log(output.slice(-1000));
 
-  // Start Go binary as callee
-  tunnel = startTunnel('connect', ['--role', 'callee'], 3004);
-  await new Promise(r => setTimeout(r, 2000));
+    // Go binary should be sending test frames
+    // (may log errors if DC not open yet, but should eventually send)
+    expect(output).toContain('[tx]');
+  });
 
-  // Open browser as caller
-  await page.goto('http://localhost:3004');
-  await page.selectOption('#role', 'caller');
-  await page.selectOption('#videoSource', 'canvas');
-  await page.click('#btnStart');
+  test('Browser sends frames that Go binary receives', async ({ page }) => {
+    signaling = await startSignaling(SIGNALING_PORT_2);
 
-  await expect(page.locator('#status')).toHaveText(/Connected/, { timeout: 15000 });
+    // Start Go binary as callee
+    tunnel = startTunnel('connect', ['--role', 'callee'], SIGNALING_PORT_2);
+    await waitForOutput(tunnel, 'connecting', 10000);
+    await sleep(1500);
 
-  // Send test frames from browser
-  await page.click('#btnSendTest');
-  await new Promise(r => setTimeout(r, 5000));
+    // Open browser as caller
+    await page.goto(`http://localhost:${SIGNALING_PORT_2}`);
+    await page.selectOption('#role', 'caller');
+    await page.click('#btnStart');
 
-  // Check Go binary output for received frames
-  const output = tunnel.getOutput();
-  console.log('Go binary output:', output);
+    await expect(page.locator('#status')).toHaveText(/Connected/, { timeout: 20000 });
 
-  const hasRx = output.includes('[rx]');
-  console.log('Go received frames:', hasRx);
+    // Send test frames from browser to Go binary
+    await page.click('#btnSendTest');
+    await sleep(5000);
 
-  await page.screenshot({ path: 'screenshots/04-browser-sends.png' });
+    // Check Go binary output for received frames
+    const output = tunnel.getOutput();
+    console.log('--- Go binary output (truncated) ---');
+    console.log(output.slice(-1000));
+
+    const hasRx = output.includes('[rx]');
+    console.log('Go binary received frames:', hasRx);
+    expect(hasRx).toBe(true);
+  });
 });

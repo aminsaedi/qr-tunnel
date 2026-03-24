@@ -5,3 +5,4 @@ node_modules/
 .DS_Store
 tests/screenshots/
 package-lock.json
+tests/test-results/
