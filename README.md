@@ -33,7 +33,7 @@ A single Go binary that encodes outbound TCP data as QR code frames, sends them 
 
 ```bash
 # Clone and build
-git clone https://github.com/AminKhosroAli/qr-tunnel.git
+git clone https://github.com/aminsaedi/qr-tunnel.git
 cd qr-tunnel
 make build
 

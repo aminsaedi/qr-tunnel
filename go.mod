@@ -1,4 +1,4 @@
-module github.com/AminKhosroAli/qr-tunnel
+module github.com/aminsaedi/qr-tunnel
 
 go 1.25.5
 

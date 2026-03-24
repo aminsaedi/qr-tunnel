@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AminKhosroAli/qr-tunnel/internal/provider"
+	"github.com/aminsaedi/qr-tunnel/internal/provider"
 	"github.com/pion/webrtc/v3"
 )
 

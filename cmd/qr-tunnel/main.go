@@ -9,13 +9,13 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AminKhosroAli/qr-tunnel/internal/provider"
-	webrtcProvider "github.com/AminKhosroAli/qr-tunnel/internal/provider/webrtc"
-	"github.com/AminKhosroAli/qr-tunnel/internal/qr"
-	"github.com/AminKhosroAli/qr-tunnel/internal/socks5"
-	"github.com/AminKhosroAli/qr-tunnel/internal/transport"
-	"github.com/AminKhosroAli/qr-tunnel/internal/tui"
-	"github.com/AminKhosroAli/qr-tunnel/internal/webui"
+	"github.com/aminsaedi/qr-tunnel/internal/provider"
+	webrtcProvider "github.com/aminsaedi/qr-tunnel/internal/provider/webrtc"
+	"github.com/aminsaedi/qr-tunnel/internal/qr"
+	"github.com/aminsaedi/qr-tunnel/internal/socks5"
+	"github.com/aminsaedi/qr-tunnel/internal/transport"
+	"github.com/aminsaedi/qr-tunnel/internal/tui"
+	"github.com/aminsaedi/qr-tunnel/internal/webui"
 )
 
 var Version = "dev"

@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Validate version format
+        run: |
+          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: version must match vX.Y.Z (e.g. v0.1.0)"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: go test ./internal/... -race -timeout 120s
+
+      - name: Build all targets
+        env:
+          CGO_ENABLED: "0"
+          VERSION: ${{ inputs.version }}
+        run: |
+          LDFLAGS="-s -w -X main.Version=${VERSION}"
+          mkdir -p dist
+
+          GOOS=darwin  GOARCH=amd64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-darwin-amd64       ./cmd/qr-tunnel
+          GOOS=darwin  GOARCH=arm64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-darwin-arm64       ./cmd/qr-tunnel
+          GOOS=linux   GOARCH=amd64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-linux-amd64        ./cmd/qr-tunnel
+          GOOS=linux   GOARCH=arm64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-linux-arm64        ./cmd/qr-tunnel
+          GOOS=windows GOARCH=amd64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-windows-amd64.exe  ./cmd/qr-tunnel
+
+          ls -lh dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > checksums.txt
+          cat checksums.txt
+
+      - name: Create git tag
+        run: |
+          git tag "${{ inputs.version }}"
+          git push origin "${{ inputs.version }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: ${{ inputs.version }}
+          generate_release_notes: true
+          files: |
+            dist/qr-tunnel-darwin-amd64
+            dist/qr-tunnel-darwin-arm64
+            dist/qr-tunnel-linux-amd64
+            dist/qr-tunnel-linux-arm64
+            dist/qr-tunnel-windows-amd64.exe
+            dist/checksums.txt

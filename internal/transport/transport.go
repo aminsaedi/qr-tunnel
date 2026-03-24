@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AminKhosroAli/qr-tunnel/internal/provider"
-	"github.com/AminKhosroAli/qr-tunnel/internal/qr"
+	"github.com/aminsaedi/qr-tunnel/internal/provider"
+	"github.com/aminsaedi/qr-tunnel/internal/qr"
 )
 
 // Frame flags

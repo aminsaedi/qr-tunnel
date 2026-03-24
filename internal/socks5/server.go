@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/AminKhosroAli/qr-tunnel/internal/transport"
+	"github.com/aminsaedi/qr-tunnel/internal/transport"
 )
 
 const (

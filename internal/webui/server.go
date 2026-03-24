@@ -13,7 +13,7 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/AminKhosroAli/qr-tunnel/internal/tui"
+	"github.com/aminsaedi/qr-tunnel/internal/tui"
 )
 
 //go:embed static/*

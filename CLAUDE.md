@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **qr-tunnel** — a Go binary that tunnels TCP traffic through video calls by encoding data as animated QR codes. It uses LT fountain codes for loss resilience and exposes a SOCKS5 proxy for apps to connect through.
 
-Module: `github.com/AminKhosroAli/qr-tunnel`
+Module: `github.com/aminsaedi/qr-tunnel`
 
 ## Build & Test Commands
 
