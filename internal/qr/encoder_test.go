@@ -12,7 +12,9 @@ import (
 func TestEncoderDecoderRoundTrip(t *testing.T) {
 	// Generate test data
 	original := make([]byte, 5000)
-	rand.Read(original)
+	if _, err := rand.Read(original); err != nil {
+		t.Fatal(err)
+	}
 
 	config := DefaultEncoderConfig()
 	config.ChunkSize = 200 // smaller chunks for test
@@ -72,7 +74,9 @@ func TestEncoderDecoderRoundTrip(t *testing.T) {
 
 func TestEncoderDecoderWithFrameLoss(t *testing.T) {
 	original := make([]byte, 10000)
-	rand.Read(original)
+	if _, err := rand.Read(original); err != nil {
+		t.Fatal(err)
+	}
 
 	config := DefaultEncoderConfig()
 	config.ChunkSize = 200

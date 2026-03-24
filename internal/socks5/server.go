@@ -45,7 +45,6 @@ type Server struct {
 	transport *transport.Transport
 	listener  net.Listener
 	nextID    atomic.Uint32
-	mu        sync.Mutex
 
 	// Metrics
 	ActiveConns atomic.Int32
@@ -91,7 +90,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	}()
 
 	// Set deadline for handshake
-	conn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// ---- AUTH negotiation ----
 	// Client: [version][nmethods][methods...]
@@ -117,10 +116,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 	}
 	if !hasNoAuth {
-		conn.Write([]byte{socks5Version, 0xFF}) // no acceptable methods
+		_, _ = conn.Write([]byte{socks5Version, 0xFF}) // no acceptable methods
 		return
 	}
-	conn.Write([]byte{socks5Version, authNone})
+	_, _ = conn.Write([]byte{socks5Version, authNone})
 
 	// ---- REQUEST ----
 	// Client: [version][cmd][rsv][atyp][addr][port]
@@ -176,7 +175,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	log.Printf("[socks5] CONNECT %s", dst)
 
 	// Clear deadline for data relay
-	conn.SetDeadline(time.Time{})
+	_ = conn.SetDeadline(time.Time{})
 
 	// Open a transport stream
 	streamID := uint16(s.nextID.Add(1))
@@ -202,13 +201,13 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, conn)
+		_, _ = io.Copy(stream, conn)
 		stream.Close()
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, stream)
+		_, _ = io.Copy(conn, stream)
 		conn.Close()
 	}()
 
@@ -251,12 +250,12 @@ func (s *Server) handleServerStream(stream *transport.Stream) {
 
 	go func() {
 		defer wg.Done()
-		io.Copy(conn, stream)
+		_, _ = io.Copy(conn, stream)
 	}()
 
 	go func() {
 		defer wg.Done()
-		io.Copy(stream, conn)
+		_, _ = io.Copy(stream, conn)
 	}()
 
 	wg.Wait()
@@ -277,7 +276,7 @@ func sendReply(conn net.Conn, rep byte, bindAddr net.IP, bindPort uint16) {
 	port := make([]byte, 2)
 	binary.BigEndian.PutUint16(port, bindPort)
 	reply = append(reply, port...)
-	conn.Write(reply)
+	_, _ = conn.Write(reply)
 }
 
 // Close stops the SOCKS5 server.

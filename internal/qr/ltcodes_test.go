@@ -106,7 +106,9 @@ func TestLTCodesStress(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		size := 1000 + i*500
 		original := make([]byte, size)
-		rand.Read(original)
+		if _, err := rand.Read(original); err != nil {
+			t.Fatal(err)
+		}
 
 		blockSize := 200
 		enc := NewLTEncoder(original, blockSize)

@@ -35,7 +35,6 @@ type decodeSession struct {
 	decoder   *LTDecoder
 	lastSeen  time.Time
 	completed bool
-	dataLen   int // original data length hint
 }
 
 func NewDecoder(onData func(sessionID uint32, data []byte)) *Decoder {

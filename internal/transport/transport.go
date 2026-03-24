@@ -93,7 +93,6 @@ type Transport struct {
 	mu          sync.RWMutex
 	sendQueue   chan *transportFrame
 	acceptQueue chan *Stream
-	nextID      atomic.Uint32
 	ctx         context.Context
 	cancel      context.CancelFunc
 

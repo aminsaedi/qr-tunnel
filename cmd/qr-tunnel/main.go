@@ -108,7 +108,7 @@ func runClient(args []string) {
 	fs := flag.NewFlagSet("client", flag.ExitOnError)
 	cf := addCommonFlags(fs)
 	socksAddr := fs.String("socks5", ":1080", "SOCKS5 listen address")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -171,7 +171,7 @@ func runClient(args []string) {
 func runServer(args []string) {
 	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	cf := addCommonFlags(fs)
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 
@@ -231,7 +231,7 @@ func runConnect(args []string) {
 	fs := flag.NewFlagSet("connect", flag.ExitOnError)
 	cf := addCommonFlags(fs)
 	testFrames := fs.Bool("test-frames", false, "send test pattern frames")
-	fs.Parse(args)
+	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Printf("qr-tunnel %s — connect mode", Version)

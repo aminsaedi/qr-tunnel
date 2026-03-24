@@ -166,7 +166,7 @@ func (s *Server) collectMetrics() metricsPayload {
 
 func (s *Server) handleMetricsAPI(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.collectMetrics())
+	_ = json.NewEncoder(w).Encode(s.collectMetrics())
 }
 
 type simRequest struct {
@@ -181,7 +181,7 @@ type simRequest struct {
 func (s *Server) handleSim(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "GET" {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"dropRate":  s.metrics.DropRate.Load(),
 			"noisePct":  s.metrics.NoisePct.Load(),
 			"delayMs":   s.metrics.DelayMs.Load(),
@@ -223,7 +223,7 @@ func (s *Server) handleSim(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 func (s *Server) Close() error {
