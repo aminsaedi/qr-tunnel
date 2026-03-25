@@ -34,7 +34,7 @@ jobs:
       - name: Run tests
         run: go test ./internal/... -race -timeout 120s
 
-      - name: Build all targets
+      - name: Build and package all targets
         env:
           CGO_ENABLED: "0"
           VERSION: ${{ inputs.version }}
@@ -42,11 +42,26 @@ jobs:
           LDFLAGS="-s -w -X main.Version=${VERSION}"
           mkdir -p dist
 
-          GOOS=darwin  GOARCH=amd64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-darwin-amd64       ./cmd/qr-tunnel
-          GOOS=darwin  GOARCH=arm64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-darwin-arm64       ./cmd/qr-tunnel
-          GOOS=linux   GOARCH=amd64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-linux-amd64        ./cmd/qr-tunnel
-          GOOS=linux   GOARCH=arm64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-linux-arm64        ./cmd/qr-tunnel
-          GOOS=windows GOARCH=amd64 go build -ldflags="$LDFLAGS" -o dist/qr-tunnel-windows-amd64.exe  ./cmd/qr-tunnel
+          # Build each target, package as tar.gz (unix) or zip (windows)
+          for pair in "darwin amd64" "darwin arm64" "linux amd64" "linux arm64" "windows amd64"; do
+            OS=$(echo $pair | cut -d' ' -f1)
+            ARCH=$(echo $pair | cut -d' ' -f2)
+            BIN="qr-tunnel"
+            if [ "$OS" = "windows" ]; then BIN="qr-tunnel.exe"; fi
+
+            echo "Building ${OS}/${ARCH}..."
+            GOOS=$OS GOARCH=$ARCH go build -ldflags="$LDFLAGS" -o "dist/${BIN}" ./cmd/qr-tunnel
+
+            cd dist
+            ARCHIVE="qr-tunnel-${OS}-${ARCH}"
+            if [ "$OS" = "windows" ]; then
+              zip "${ARCHIVE}.zip" "$BIN"
+            else
+              tar czf "${ARCHIVE}.tar.gz" "$BIN"
+            fi
+            rm "$BIN"
+            cd ..
+          done
 
           ls -lh dist/
 
@@ -67,10 +82,4 @@ jobs:
           tag_name: ${{ inputs.version }}
           name: ${{ inputs.version }}
           generate_release_notes: true
-          files: |
-            dist/qr-tunnel-darwin-amd64
-            dist/qr-tunnel-darwin-arm64
-            dist/qr-tunnel-linux-amd64
-            dist/qr-tunnel-linux-arm64
-            dist/qr-tunnel-windows-amd64.exe
-            dist/checksums.txt
+          files: dist/*
