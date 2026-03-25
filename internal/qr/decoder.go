@@ -50,12 +50,10 @@ func NewDecoder(onData func(sessionID uint32, data []byte)) *Decoder {
 
 // ProcessFrame processes one incoming video frame, attempting QR decode.
 func (d *Decoder) ProcessFrame(frame *image.RGBA) {
-	d.FramesProcessed.Add(1)
+	count := d.FramesProcessed.Add(1)
 
-	// Frame change detection via corner color
-	if d.isDuplicateFrame(frame) {
-		return
-	}
+	// Skip duplicate frame check for now — video codec changes pixels every frame
+	// so the corner color detector doesn't work reliably through compression
 
 	// Convert to grayscale for QR scanning
 	gray := binarize(frame)
@@ -64,13 +62,19 @@ func (d *Decoder) ProcessFrame(frame *image.RGBA) {
 	b64Data, err := decodeQR(gray)
 	if err != nil {
 		d.FramesFailed.Add(1)
+		if count%100 == 1 {
+			log.Printf("[qr-decoder] frame #%d: QR decode failed: %v", count, err)
+		}
 		return
 	}
+
+	log.Printf("[qr-decoder] frame #%d: QR DECODED! (%d bytes b64)", count, len(b64Data))
 
 	// Base64 decode to get binary payload
 	payload, err := base64.StdEncoding.DecodeString(string(b64Data))
 	if err != nil {
 		d.FramesFailed.Add(1)
+		log.Printf("[qr-decoder] frame #%d: base64 decode failed: %v (data: %s)", count, err, string(b64Data)[:min(50, len(b64Data))])
 		return
 	}
 
@@ -103,14 +107,17 @@ func (d *Decoder) isDuplicateFrame(frame *image.RGBA) bool {
 // processPayload parses a decoded QR payload and feeds it to the LT decoder.
 func (d *Decoder) processPayload(payload []byte) {
 	if len(payload) < qrHeaderSize {
+		log.Printf("[qr-decoder] processPayload: too short (%d < %d)", len(payload), qrHeaderSize)
 		return
 	}
 
 	magic := payload[0]
 	version := payload[1]
 	if magic != 0xAA || version != 0x01 {
+		log.Printf("[qr-decoder] processPayload: bad magic/version: 0x%02x 0x%02x", magic, version)
 		return
 	}
+	log.Printf("[qr-decoder] processPayload: valid header, %d bytes", len(payload))
 
 	sessionID := binary.BigEndian.Uint32(payload[2:6])
 	// seqNum := binary.BigEndian.Uint32(payload[6:10])
@@ -142,12 +149,15 @@ func (d *Decoder) processPayload(payload []byte) {
 	}
 
 	session.decoder.AddBlock(uint32(ltBlockIndex), ltBlockSeed, ltData)
+	log.Printf("[qr-decoder] LT block added: session=%d blocks=%d/%d complete=%v",
+		sessionID, ltBlockIndex, totalSourceBlocks, session.decoder.IsComplete())
 
 	if session.decoder.IsComplete() {
 		session.completed = true
 		data, err := session.decoder.Decode()
 		d.mu.Unlock()
 
+		log.Printf("[qr-decoder] LT DECODE COMPLETE! session=%d data=%d bytes err=%v", sessionID, len(data), err)
 		if err == nil && d.onData != nil {
 			d.onData(sessionID, data)
 		}

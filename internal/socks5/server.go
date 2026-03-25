@@ -185,7 +185,7 @@ func (s *Server) handleConn(conn net.Conn) {
 	stream.SetSYNPayload([]byte(dst))
 
 	// Wait for stream to open
-	if err := stream.WaitOpen(10 * time.Second); err != nil {
+	if err := stream.WaitOpen(60 * time.Second); err != nil {
 		log.Printf("[socks5] stream open failed: %v", err)
 		sendReply(conn, repHostUnreachable, nil, 0)
 		stream.Close()

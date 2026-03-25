@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aminsaedi/qr-tunnel/internal/provider"
+	baleProvider "github.com/aminsaedi/qr-tunnel/internal/provider/bale"
 	webrtcProvider "github.com/aminsaedi/qr-tunnel/internal/provider/webrtc"
 	"github.com/aminsaedi/qr-tunnel/internal/qr"
 	"github.com/aminsaedi/qr-tunnel/internal/socks5"
@@ -35,6 +36,10 @@ func main() {
 		runServer(os.Args[2:])
 	case "connect":
 		runConnect(os.Args[2:])
+	case "bale-client":
+		runBaleClient(os.Args[2:])
+	case "bale-server":
+		runBaleServer(os.Args[2:])
 	case "--help", "-h", "help":
 		printUsage()
 	default:
@@ -48,10 +53,12 @@ func printUsage() {
 	fmt.Fprintf(os.Stderr, `qr-tunnel %s — TCP tunnel over video calls using QR codes
 
 Usage:
-  qr-tunnel client  [flags]    Client mode (SOCKS5 proxy + TUI)
-  qr-tunnel server  [flags]    Server mode (exit node + TUI)
-  qr-tunnel connect [flags]    Simple connect (debug mode, no TUI)
-  qr-tunnel version            Show version
+  qr-tunnel client      [flags]  Client mode (SOCKS5 proxy + TUI)
+  qr-tunnel server      [flags]  Server mode (exit node + TUI)
+  qr-tunnel connect     [flags]  Simple connect (debug mode, no TUI)
+  qr-tunnel bale-client [flags]  Bale messenger client (SOCKS5 via Bale video call)
+  qr-tunnel bale-server [flags]  Bale messenger server (exit node via Bale video call)
+  qr-tunnel version              Show version
 
 Common Flags:
   --signaling    Signaling server URL (default: ws://localhost:3000)
@@ -331,4 +338,105 @@ func updateMetrics(metrics *tui.MetricsSource, tr *transport.Transport, socksSer
 			metrics.ActiveConns.Store(socksServer.ActiveConns.Load())
 		}
 	}
+}
+
+// --- Bale integration commands ---
+
+func runBaleClient(args []string) {
+	fs := flag.NewFlagSet("bale-client", flag.ExitOnError)
+	bridge := fs.String("bridge", "ws://localhost:9000", "browser bridge WebSocket URL")
+	socksAddr := fs.String("socks5", ":1080", "SOCKS5 listen address")
+	fps := fs.Int("fps", 12, "QR frames per second")
+	qrVersion := fs.Int("qr-version", 15, "QR version (lower = larger modules, better codec survival)")
+	ecc := fs.String("ecc", "H", "error correction level")
+	chunkSize := fs.Int("chunk-size", 300, "bytes per LT block")
+	_ = fs.Parse(args)
+
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	log.Printf("qr-tunnel %s — Bale client mode", Version)
+	log.Printf("bridge: %s, socks5: %s", *bridge, *socksAddr)
+
+	p := baleProvider.NewBaleProvider()
+	p.OnState(func(state provider.State) {
+		log.Printf("[state] %s", state)
+	})
+
+	if err := p.Connect(*bridge, provider.CallOptions{Role: "caller"}); err != nil {
+		log.Fatalf("bridge connect failed: %v", err)
+	}
+	defer p.Close()
+
+	// Create transport
+	tConfig := transport.DefaultConfig()
+	tConfig.QRConfig = qr.EncoderConfig{
+		Version:         *qrVersion,
+		ErrorCorrection: *ecc,
+		ChunkSize:       *chunkSize,
+		FPS:             *fps,
+		FrameWidth:      720,
+		FrameHeight:     720,
+	}
+	tr := transport.NewTransport(p, tConfig)
+	defer tr.Close()
+
+	// Start SOCKS5
+	socksServer := socks5.NewServer(tr)
+	if err := socksServer.Start(*socksAddr); err != nil {
+		log.Fatalf("socks5 start failed: %v", err)
+	}
+	defer socksServer.Close()
+	log.Printf("[socks5] SOCKS proxy listening on %s", *socksAddr)
+	log.Printf("[socks5] Test: curl --socks5 localhost%s https://httpbin.org/ip", *socksAddr)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Println("shutting down...")
+}
+
+func runBaleServer(args []string) {
+	fs := flag.NewFlagSet("bale-server", flag.ExitOnError)
+	bridge := fs.String("bridge", "ws://localhost:9001", "browser bridge WebSocket URL")
+	fps := fs.Int("fps", 12, "QR frames per second")
+	qrVersion := fs.Int("qr-version", 15, "QR version")
+	ecc := fs.String("ecc", "H", "error correction level")
+	chunkSize := fs.Int("chunk-size", 300, "bytes per LT block")
+	_ = fs.Parse(args)
+
+	log.SetFlags(log.Ltime | log.Lmicroseconds)
+	log.Printf("qr-tunnel %s — Bale server mode", Version)
+	log.Printf("bridge: %s", *bridge)
+
+	p := baleProvider.NewBaleProvider()
+	p.OnState(func(state provider.State) {
+		log.Printf("[state] %s", state)
+	})
+
+	if err := p.Connect(*bridge, provider.CallOptions{Role: "callee"}); err != nil {
+		log.Fatalf("bridge connect failed: %v", err)
+	}
+	defer p.Close()
+
+	// Create transport
+	tConfig := transport.DefaultConfig()
+	tConfig.QRConfig = qr.EncoderConfig{
+		Version:         *qrVersion,
+		ErrorCorrection: *ecc,
+		ChunkSize:       *chunkSize,
+		FPS:             *fps,
+		FrameWidth:      720,
+		FrameHeight:     720,
+	}
+	tr := transport.NewTransport(p, tConfig)
+	defer tr.Close()
+
+	// Accept streams and dial real TCP destinations (exit node)
+	socksServer := socks5.NewServer(tr)
+	go socksServer.HandleServerSide()
+	log.Printf("[server] exit node ready — accepting tunnel streams")
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	<-sigCh
+	log.Println("shutting down...")
 }

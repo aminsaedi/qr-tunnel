@@ -6,3 +6,7 @@ node_modules/
 tests/screenshots/
 package-lock.json
 tests/test-results/
+profile-a/
+profile-b/
+bale-analysis/logs/
+bale-analysis/profile-*/
