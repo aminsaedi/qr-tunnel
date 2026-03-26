@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log"
 	"sync"
@@ -112,7 +113,8 @@ func (s *Stream) Write(data []byte) (int, error) {
 		s.sendMu.Unlock()
 
 		// Queue for sending
-		log.Printf("[stream] Write: stream=%d seq=%d chunk=%d bytes", s.ID, seq, len(chunk))
+		chunkHash := crc32.ChecksumIEEE(chunk)
+		log.Printf("[stream] Write: stream=%d seq=%d chunk=%d bytes hash=%08x", s.ID, seq, len(chunk), chunkHash)
 		s.transport.sendQueue <- &transportFrame{
 			Flags:      FlagDATA,
 			StreamID:   s.ID,
@@ -170,6 +172,9 @@ func (s *Stream) ReadSYNPayload() []byte {
 func (s *Stream) handleData(seqNum uint32, data []byte) {
 	s.recvMu.Lock()
 	defer s.recvMu.Unlock()
+
+	dataHash := crc32.ChecksumIEEE(data)
+	log.Printf("[stream] handleData: stream=%d seq=%d data=%d bytes hash=%08x", s.ID, seqNum, len(data), dataHash)
 
 	s.needsAck = true
 	s.recvSeq = seqNum
