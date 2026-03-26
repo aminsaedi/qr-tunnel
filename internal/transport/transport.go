@@ -103,7 +103,7 @@ func DefaultConfig() Config {
 		BitmapConfig:  bitmap.DefaultConfig(),
 		FPS:           15,
 		WindowSize:    32,
-		RetransmitMin: 1 * time.Second,
+		RetransmitMin: 5 * time.Second, // Video pipeline RTT is ~4s, retransmit must be longer
 		AckInterval:   200 * time.Millisecond,
 	}
 }
@@ -304,14 +304,11 @@ func (t *Transport) handleFrame(f *transportFrame) {
 }
 
 // sendLoop pulls frames from the send queue and encodes them into bitmap frames.
-// Only sends 1 bitmap frame per tick to give each frame time on the canvas.
 func (t *Transport) sendLoop() {
-	// Tick at half the FPS rate — each bitmap stays on screen for 2 video frames
-	// This gives the other side's capture more time to read each code
-	interval := time.Second / time.Duration(t.config.FPS) * 2
-	if interval < 100*time.Millisecond {
-		interval = 100 * time.Millisecond
-	}
+	// Each bitmap needs ~500ms on screen for reliable capture.
+	// With 15-20fps video capture, 500ms = 8-10 captures per frame.
+	// This ensures every frame is seen even with video pipeline jitter.
+	interval := 500 * time.Millisecond
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -384,11 +381,13 @@ func (t *Transport) sendData(data []byte) {
 		return
 	}
 
-	if err := t.provider.SendFrame(&provider.Frame{
+	frame := &provider.Frame{
 		Image:  img,
 		Width:  bitmap.FrameWidth,
 		Height: bitmap.FrameHeight,
-	}); err == nil {
+	}
+
+	if err := t.provider.SendFrame(frame); err == nil {
 		t.BytesSent.Add(int64(len(data)))
 	}
 }

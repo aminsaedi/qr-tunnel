@@ -87,7 +87,11 @@ func (s *Stream) Write(data []byte) (int, error) {
 	}
 
 	// Fragment into chunks
-	maxChunk := 400 // Must fit in one bitmap frame with transport header overhead
+	maxPayload := s.transport.config.BitmapConfig.MaxPayloadBytes()
+	maxChunk := maxPayload - 19 // subtract transport header size
+	if maxChunk < 50 {
+		maxChunk = 50
+	}
 	written := 0
 
 	for written < len(data) {

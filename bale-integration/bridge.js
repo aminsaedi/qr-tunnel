@@ -11,7 +11,7 @@ const targetUser = args.find((_, i, a) => a[i - 1] === '--target') || '884923192
 const wsPort = parseInt(args.find((_, i, a) => a[i - 1] === '--ws-port') || '9000');
 const profileDir = args.find((_, i, a) => a[i - 1] === '--profile') ||
   path.join(__dirname, role === 'caller' ? 'profile-a' : 'profile-b');
-const FPS = 15; // Increased from 10 for better throughput
+const FPS = 20; // Higher capture rate for bitmap codec
 const FAKE_CAMERA = '/tmp/qr-fake-camera.y4m';
 
 console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort}`);
@@ -57,7 +57,7 @@ setInterval(async () => {
       img.src = 'data:image/jpeg;base64,' + b64;
     }, b64);
   } catch {}
-}, 50); // 20fps pump rate
+}, 33); // 30fps pump rate — bitmap only needs 1 clean capture
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 

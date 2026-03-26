@@ -248,7 +248,8 @@ func (s *Server) handleServerStream(stream *transport.Stream) {
 		return
 	}
 	firstData := firstBuf[:n]
-	log.Printf("[socks5-server] stream %d: got %d bytes, dialing %s", stream.ID, n, dst)
+	hexPrefix := fmt.Sprintf("%x", firstData[:min(20, len(firstData))])
+	log.Printf("[socks5-server] stream %d: got %d bytes (hex: %s), dialing %s", stream.ID, n, hexPrefix, dst)
 
 	conn, err := net.DialTimeout("tcp", dst, 10*time.Second)
 	if err != nil {

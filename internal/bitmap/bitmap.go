@@ -17,11 +17,11 @@ const (
 )
 
 // Luminance levels for 2-bit encoding (4 levels).
-// Avoids pure 0 and 255 to reduce codec ringing artifacts.
-var Levels2 = [4]uint8{32, 108, 184, 240}
+// Wider spacing for better codec resilience: gap of 80 between levels.
+var Levels2 = [4]uint8{20, 100, 180, 250}
 
 // Thresholds for decoding 2-bit (midpoints between levels).
-var Thresholds2 = [3]uint8{70, 146, 212}
+var Thresholds2 = [3]uint8{60, 140, 215}
 
 // Luminance levels for 1-bit encoding (2 levels).
 var Levels1 = [2]uint8{40, 220}
