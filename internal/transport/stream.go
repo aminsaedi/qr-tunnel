@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -103,6 +104,7 @@ func (s *Stream) Write(data []byte) (int, error) {
 		s.sendMu.Unlock()
 
 		// Queue for sending
+		log.Printf("[stream] Write: stream=%d seq=%d chunk=%d bytes", s.ID, seq, len(chunk))
 		s.transport.sendQueue <- &transportFrame{
 			Flags:      FlagDATA,
 			StreamID:   s.ID,

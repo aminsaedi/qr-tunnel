@@ -103,6 +103,8 @@ func (e *Encoder) eccLevel() qrcode.RecoveryLevel {
 // Encode splits data into LT-coded blocks and returns a channel of *image.RGBA frames.
 // Frames are produced indefinitely until ctx is cancelled (fountain code property).
 func (e *Encoder) Encode(ctx context.Context, data []byte) (<-chan *image.RGBA, error) {
+	// New session ID for each Encode call so decoder doesn't treat new data as duplicate
+	e.sessionID = e.rng.Uint32()
 	lt := NewLTEncoder(data, e.config.ChunkSize)
 	ch := make(chan *image.RGBA, 4)
 

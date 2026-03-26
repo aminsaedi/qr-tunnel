@@ -174,15 +174,20 @@ func (t *Transport) Close() {
 // handleIncomingData processes reassembled data from the QR decoder.
 // The data may contain one or more packed transport frames.
 func (t *Transport) handleIncomingData(data []byte) {
+	log.Printf("[transport] handleIncomingData: %d bytes", len(data))
 	offset := 0
 	for offset < len(data) {
 		if len(data)-offset < transportHeaderSize {
+			log.Printf("[transport] remaining %d bytes < header %d, stopping", len(data)-offset, transportHeaderSize)
 			break
 		}
 		frame, err := decodeTransportFrame(data[offset:])
 		if err != nil {
+			log.Printf("[transport] decodeFrame error at offset %d: %v", offset, err)
 			break
 		}
+		log.Printf("[transport] frame: flags=0x%02x stream=%d seq=%d ack=%d payload=%d",
+			frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload))
 		offset += transportHeaderSize + len(frame.Payload)
 		t.handleFrame(frame)
 	}
@@ -227,8 +232,11 @@ func (t *Transport) handleFrame(f *transportFrame) {
 
 	// Handle SYN+ACK (stream opened successfully)
 	if f.Flags&(FlagSYN|FlagACK) == FlagSYN|FlagACK {
-		stream.state = streamStateOpen
-		close(stream.opened)
+		if stream.state == streamStateSynSent {
+			stream.state = streamStateOpen
+			log.Printf("[transport] stream %d: SYN+ACK received, opening", f.StreamID)
+			close(stream.opened)
+		}
 		return
 	}
 
