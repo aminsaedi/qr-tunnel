@@ -332,20 +332,21 @@ func (t *Transport) handleFrame(f *transportFrame) {
 
 // sendLoop pulls frames from the send queue and encodes them into bitmap frames.
 func (t *Transport) sendLoop() {
-	// Each bitmap needs ~300ms on screen for reliable capture.
-	// With 15-20fps video capture, 300ms = 5-6 captures per frame.
-	// Balance between reliability and throughput for HTTPS handshakes.
-	interval := 500 * time.Millisecond
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
+	iteration := 0
 	for {
 		select {
 		case <-t.ctx.Done():
 			return
-		case <-ticker.C:
-			t.sendPendingFrames()
+		default:
 		}
+
+		iteration++
+		if iteration%10 == 1 {
+			log.Printf("[sendLoop] tick #%d, queue=%d", iteration, len(t.sendQueue))
+		}
+
+		t.sendPendingFrames()
+		time.Sleep(300 * time.Millisecond)
 	}
 }
 
@@ -404,23 +405,18 @@ doneQueue:
 }
 
 func (t *Transport) sendData(data []byte) {
-	// Encode and send in a fire-and-forget goroutine to not block the sendLoop ticker
-	dataCopy := make([]byte, len(data))
-	copy(dataCopy, data)
-	go func() {
-		img := t.encoder.EncodePacket(t.nextSeq(), dataCopy)
-		if img == nil {
-			return
-		}
-		frame := &provider.Frame{
-			Image:  img,
-			Width:  bitmap.FrameWidth,
-			Height: bitmap.FrameHeight,
-		}
-		if err := t.provider.SendFrame(frame); err == nil {
-			t.BytesSent.Add(int64(len(dataCopy)))
-		}
-	}()
+	img := t.encoder.EncodePacket(t.nextSeq(), data)
+	if img == nil {
+		return
+	}
+	frame := &provider.Frame{
+		Image:  img,
+		Width:  bitmap.FrameWidth,
+		Height: bitmap.FrameHeight,
+	}
+	if err := t.provider.SendFrame(frame); err == nil {
+		t.BytesSent.Add(int64(len(data)))
+	}
 }
 
 // Metrics returns current transport metrics.
