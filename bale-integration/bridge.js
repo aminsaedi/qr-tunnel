@@ -222,7 +222,7 @@ async function main() {
   const context = await chromium.launchPersistentContext(profileDir, {
     headless: false,
     args: [
-      '--disable-blink-features=AutomationControlled', '--no-sandbox',
+      '--disable-blink-features=AutomationControlled', '--no-sandbox', '--no-proxy-server',
       '--disable-web-security', '--disable-site-isolation-trials',
       '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${FAKE_CAMERA}`,
       // Enable experimental APIs for TransformStream pipeline
