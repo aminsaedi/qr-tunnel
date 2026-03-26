@@ -173,7 +173,7 @@ func (p *BaleProvider) SendFrame(frame *provider.Frame) error {
 	binary.BigEndian.PutUint16(header[6:8], uint16(frame.Height))
 	buf.Write(header)
 
-	if err := jpeg.Encode(&buf, frame.Image, &jpeg.Options{Quality: 75}); err != nil {
+	if err := jpeg.Encode(&buf, frame.Image, &jpeg.Options{Quality: 95}); err != nil {
 		return fmt.Errorf("jpeg encode: %w", err)
 	}
 

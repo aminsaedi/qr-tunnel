@@ -115,6 +115,7 @@ type Transport struct {
 	decoder     *bitmap.Decoder
 	config      Config
 	seqNum      uint16
+	streamIDGen atomic.Uint32 // shared stream ID generator
 	streams     map[uint16]*Stream
 	mu          sync.RWMutex
 	sendQueue   chan *transportFrame
@@ -168,6 +169,15 @@ func (t *Transport) nextSeq() uint16 {
 	t.seqNum++
 	t.mu.Unlock()
 	return seq
+}
+
+// NextStreamID returns a unique stream ID. Use this for both SOCKS5 and HTTP proxy.
+func (t *Transport) NextStreamID() uint16 {
+	id := t.streamIDGen.Add(1)
+	if id == 0 {
+		id = t.streamIDGen.Add(1) // skip 0
+	}
+	return uint16(id)
 }
 
 // OpenStream creates a new outgoing stream with an optional SYN payload.
@@ -305,10 +315,10 @@ func (t *Transport) handleFrame(f *transportFrame) {
 
 // sendLoop pulls frames from the send queue and encodes them into bitmap frames.
 func (t *Transport) sendLoop() {
-	// Each bitmap needs ~500ms on screen for reliable capture.
-	// With 15-20fps video capture, 500ms = 8-10 captures per frame.
-	// This ensures every frame is seen even with video pipeline jitter.
-	interval := 500 * time.Millisecond
+	// Each bitmap needs ~300ms on screen for reliable capture.
+	// With 15-20fps video capture, 300ms = 5-6 captures per frame.
+	// Balance between reliability and throughput for HTTPS handshakes.
+	interval := 300 * time.Millisecond
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 

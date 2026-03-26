@@ -179,10 +179,7 @@ func (s *Server) handleConn(conn net.Conn) {
 
 	// Open a transport stream with destination as SYN payload
 	// Use sequential IDs starting from 1 (avoid 0 which is used for control)
-	streamID := uint16(s.nextID.Add(1))
-	if streamID == 0 {
-		streamID = uint16(s.nextID.Add(1)) // skip 0
-	}
+	streamID := s.transport.NextStreamID()
 	stream := s.transport.OpenStream(streamID, []byte(dst))
 
 	// Wait for stream to open — longer timeout for QR video pipeline
@@ -238,18 +235,37 @@ func (s *Server) handleServerStream(stream *transport.Stream) {
 	dst := string(synPayload)
 	log.Printf("[socks5-server] stream %d: waiting for first data before dialing %s", stream.ID, dst)
 
-	// Wait for first actual data from the client (e.g., TLS ClientHello).
-	// This ensures the target server receives data immediately after we connect,
-	// preventing TLS timeouts.
-	firstBuf := make([]byte, 4096)
-	n, err := stream.Read(firstBuf)
-	if err != nil || n == 0 {
-		log.Printf("[socks5-server] stream %d: no data: %v", stream.ID, err)
+	// Read initial data. For TLS, buffer the complete record before forwarding.
+	// For non-TLS, forward immediately.
+	var firstData []byte
+	buf := make([]byte, 4096)
+	n, err := stream.Read(buf)
+	if err == nil && n > 0 {
+		firstData = append(firstData, buf[:n]...)
+
+		// If this is TLS (starts with 0x16), read until we have the full record
+		if firstData[0] == 0x16 && len(firstData) >= 5 {
+			recordLen := int(firstData[3])<<8 | int(firstData[4])
+			deadline := time.Now().Add(5 * time.Second)
+			for len(firstData) < 5+recordLen && time.Now().Before(deadline) {
+				n, err = stream.Read(buf)
+				if n > 0 {
+					firstData = append(firstData, buf[:n]...)
+				}
+				if err != nil {
+					break
+				}
+			}
+		}
+		// For non-TLS: firstData already has the first chunk, proceed immediately
+	}
+
+	if len(firstData) == 0 {
+		log.Printf("[socks5-server] stream %d: no data received", stream.ID)
 		return
 	}
-	firstData := firstBuf[:n]
 	hexPrefix := fmt.Sprintf("%x", firstData[:min(20, len(firstData))])
-	log.Printf("[socks5-server] stream %d: got %d bytes (hex: %s), dialing %s", stream.ID, n, hexPrefix, dst)
+	log.Printf("[socks5-server] stream %d: got %d bytes (hex: %s), dialing %s", stream.ID, len(firstData), hexPrefix, dst)
 
 	conn, err := net.DialTimeout("tcp", dst, 10*time.Second)
 	if err != nil {

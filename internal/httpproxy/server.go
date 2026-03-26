@@ -87,10 +87,7 @@ func (s *Server) handleConnect(conn net.Conn, req *http.Request) {
 	_ = conn.SetDeadline(time.Time{})
 
 	// Open transport stream
-	streamID := uint16(s.nextID.Add(1))
-	if streamID == 0 {
-		streamID = uint16(s.nextID.Add(1))
-	}
+	streamID := s.transport.NextStreamID()
 	stream := s.transport.OpenStream(streamID, []byte(dst))
 
 	if err := stream.WaitOpen(90 * time.Second); err != nil {
@@ -133,10 +130,7 @@ func (s *Server) handleHTTP(conn net.Conn, req *http.Request) {
 
 	_ = conn.SetDeadline(time.Time{})
 
-	streamID := uint16(s.nextID.Add(1))
-	if streamID == 0 {
-		streamID = uint16(s.nextID.Add(1))
-	}
+	streamID := s.transport.NextStreamID()
 	stream := s.transport.OpenStream(streamID, []byte(host))
 
 	if err := stream.WaitOpen(90 * time.Second); err != nil {

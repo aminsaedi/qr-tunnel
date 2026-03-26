@@ -212,7 +212,7 @@ const INIT_SCRIPT = `
     }
     try {
       window.__captureCtx.drawImage(v, 0, 0, 720, 720);
-      return { dataUrl: window.__captureCanvas.toDataURL('image/jpeg', 0.70), vw: v.videoWidth, vh: v.videoHeight };
+      return { dataUrl: window.__captureCanvas.toDataURL('image/jpeg', 0.92), vw: v.videoWidth, vh: v.videoHeight };
     } catch(e) { return { error: e.message }; }
   };
 })();

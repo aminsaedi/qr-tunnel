@@ -227,6 +227,11 @@ func (s *Stream) handleFin() {
 
 // getPendingFrames returns transport frames that need to be sent (retransmits + ACKs).
 func (s *Stream) getPendingFrames() []*transportFrame {
+	// Don't retransmit for closed streams
+	if s.closed.Load() {
+		return nil
+	}
+
 	var frames []*transportFrame
 
 	// Send ACK if needed
