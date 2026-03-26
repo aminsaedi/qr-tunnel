@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -23,6 +24,12 @@ import (
 var Version = "dev"
 
 func main() {
+	// Ensure multiple goroutines can run concurrently
+	// (bitmap decoder is CPU-intensive and can starve the sendLoop)
+	if runtime.GOMAXPROCS(0) < 4 {
+		runtime.GOMAXPROCS(4)
+	}
+
 	if len(os.Args) < 2 {
 		printUsage()
 		os.Exit(1)

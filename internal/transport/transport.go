@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/crc32"
+	"image"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -103,7 +104,7 @@ func DefaultConfig() Config {
 		BitmapConfig:  bitmap.DefaultConfig(),
 		FPS:           15,
 		WindowSize:    32,
-		RetransmitMin: 5 * time.Second, // Video pipeline RTT is ~4s, retransmit must be longer
+		RetransmitMin: 2 * time.Second, // Quick retransmit for corrupted frames
 		AckInterval:   200 * time.Millisecond,
 	}
 }
@@ -145,16 +146,31 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	}
 	t.RTTEstimate.Store(int64(500 * time.Millisecond))
 
-	// Wire up frame callbacks — decode bitmap frames directly
+	// Wire up frame callbacks — decode bitmap frames in a goroutine
+	// to prevent blocking the sendLoop (decoder is CPU-intensive)
+	decodeCh := make(chan *image.RGBA, 5)
 	p.OnFrame(func(f *provider.Frame) {
-		_, payload, err := t.decoder.DecodeFrame(f.Image)
-		if err != nil {
-			return
-		}
-		if payload != nil {
-			t.handleIncomingData(payload)
+		select {
+		case decodeCh <- f.Image:
+		default:
+			// Drop frame if decoder is busy
 		}
 	})
+	go func() {
+		for img := range decodeCh {
+			_, payload, err := t.decoder.DecodeFrame(img)
+			if err != nil {
+				// Yield CPU to prevent starving the sendLoop goroutine
+				time.Sleep(10 * time.Millisecond)
+				continue
+			}
+			if payload != nil {
+				t.handleIncomingData(payload)
+			}
+			// Rate limit successful decodes — no need to decode faster than send rate
+			time.Sleep(50 * time.Millisecond)
+		}
+	}()
 
 	// Start send loop
 	go t.sendLoop()
@@ -226,8 +242,9 @@ func (t *Transport) handleIncomingData(data []byte) {
 		if len(data)-offset < transportHeaderSize {
 			break
 		}
-		// Stop at zero-padding (flags=0, streamID=0)
-		if data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 {
+		// Stop at zero bytes (no valid transport frame starts with 3 zero bytes)
+		// This was needed for LT fountain code padding; kept as safety check
+		if offset+2 < len(data) && data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 {
 			break
 		}
 		frame, err := decodeTransportFrame(data[offset:])
@@ -318,7 +335,7 @@ func (t *Transport) sendLoop() {
 	// Each bitmap needs ~300ms on screen for reliable capture.
 	// With 15-20fps video capture, 300ms = 5-6 captures per frame.
 	// Balance between reliability and throughput for HTTPS handshakes.
-	interval := 300 * time.Millisecond
+	interval := 500 * time.Millisecond
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -333,10 +350,9 @@ func (t *Transport) sendLoop() {
 }
 
 func (t *Transport) sendPendingFrames() {
-	// Pack frames greedily up to bitmap max payload, but only send ONE frame per tick.
-	// This gives each bitmap frame time on the canvas for the other side to capture.
 	maxPayload := t.config.BitmapConfig.MaxPayloadBytes()
 	var packed []byte
+	queueLen := len(t.sendQueue)
 
 	// Take frames from the queue (prioritize new data)
 	for {
@@ -380,26 +396,31 @@ doneQueue:
 	}
 
 	if len(packed) > 0 {
+		if queueLen > 0 {
+			log.Printf("[transport] sendPending: queue=%d packed=%d bytes", queueLen, len(packed))
+		}
 		t.sendData(packed)
 	}
 }
 
 func (t *Transport) sendData(data []byte) {
-	// Encode the packed transport frames into a bitmap and send via provider.
-	img := t.encoder.EncodePacket(t.nextSeq(), data)
-	if img == nil {
-		return
-	}
-
-	frame := &provider.Frame{
-		Image:  img,
-		Width:  bitmap.FrameWidth,
-		Height: bitmap.FrameHeight,
-	}
-
-	if err := t.provider.SendFrame(frame); err == nil {
-		t.BytesSent.Add(int64(len(data)))
-	}
+	// Encode and send in a fire-and-forget goroutine to not block the sendLoop ticker
+	dataCopy := make([]byte, len(data))
+	copy(dataCopy, data)
+	go func() {
+		img := t.encoder.EncodePacket(t.nextSeq(), dataCopy)
+		if img == nil {
+			return
+		}
+		frame := &provider.Frame{
+			Image:  img,
+			Width:  bitmap.FrameWidth,
+			Height: bitmap.FrameHeight,
+		}
+		if err := t.provider.SendFrame(frame); err == nil {
+			t.BytesSent.Add(int64(len(dataCopy)))
+		}
+	}()
 }
 
 // Metrics returns current transport metrics.
