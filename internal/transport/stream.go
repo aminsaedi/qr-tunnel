@@ -31,11 +31,13 @@ type Stream struct {
 	sendMu    sync.Mutex
 	ackCh     chan uint32
 
-	// Receive side
+	// Receive side — ordered reassembly
 	recvBuf    bytes.Buffer
 	recvMu     sync.Mutex
 	recvNotify chan struct{}
-	recvSeq    uint32 // next expected sequence number
+	recvSeq    uint32            // next expected sequence number (for ACK)
+	recvNext   uint32            // next expected seq for ordered delivery
+	recvQueue  map[uint32][]byte // out-of-order segments waiting for reassembly
 	needsAck   bool
 
 	// SYN payload (connection metadata)
@@ -61,6 +63,8 @@ func newStream(id uint16, t *Transport) *Stream {
 		state:      streamStateSynSent,
 		ackCh:      make(chan uint32, 64),
 		recvNotify: make(chan struct{}, 1),
+		recvNext:   1, // DATA seqs start at 1 (0 is SYN)
+		recvQueue:  make(map[uint32][]byte),
 		opened:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
 	}
@@ -166,10 +170,35 @@ func (s *Stream) ReadSYNPayload() []byte {
 
 func (s *Stream) handleData(seqNum uint32, data []byte) {
 	s.recvMu.Lock()
-	s.recvBuf.Write(data)
+	defer s.recvMu.Unlock()
+
 	s.needsAck = true
 	s.recvSeq = seqNum
-	s.recvMu.Unlock()
+
+	if seqNum == s.recvNext {
+		// In-order: write directly to buffer
+		s.recvBuf.Write(data)
+		s.recvNext++
+
+		// Flush any queued out-of-order segments that are now in order
+		for {
+			queued, ok := s.recvQueue[s.recvNext]
+			if !ok {
+				break
+			}
+			s.recvBuf.Write(queued)
+			delete(s.recvQueue, s.recvNext)
+			s.recvNext++
+		}
+	} else if seqNum > s.recvNext {
+		// Out of order: queue for later
+		if _, exists := s.recvQueue[seqNum]; !exists {
+			cp := make([]byte, len(data))
+			copy(cp, data)
+			s.recvQueue[seqNum] = cp
+		}
+	}
+	// else: duplicate or old segment, ignore
 
 	// Notify readers
 	select {

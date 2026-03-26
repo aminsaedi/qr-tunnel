@@ -286,8 +286,15 @@ func (t *Transport) handleFrame(f *transportFrame) {
 }
 
 // sendLoop pulls frames from the send queue and encodes them into QR frames.
+// Only sends 1 QR frame per tick to give each frame time on the canvas.
 func (t *Transport) sendLoop() {
-	ticker := time.NewTicker(time.Second / time.Duration(t.config.QRConfig.FPS))
+	// Tick at half the FPS rate — each QR stays on screen for 2 video frames
+	// This gives the other side's capture more time to read each code
+	interval := time.Second / time.Duration(t.config.QRConfig.FPS) * 2
+	if interval < 100*time.Millisecond {
+		interval = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
@@ -301,22 +308,26 @@ func (t *Transport) sendLoop() {
 }
 
 func (t *Transport) sendPendingFrames() {
-	// Collect frames to send (pack greedily up to chunk size)
+	// Pack frames greedily up to chunk size, but only send ONE QR per tick.
+	// This gives each QR frame time on the canvas for the other side to capture.
 	maxPayload := t.config.QRConfig.ChunkSize
 	var packed []byte
 
-	// Prioritize NEW data from sendQueue over retransmits.
-	// Drain the send queue first.
-	hasNew := false
+	// Take frames from the queue (prioritize new data)
 	for {
 		select {
 		case frame := <-t.sendQueue:
-			hasNew = true
 			encoded := encodeTransportFrame(frame)
 			if len(packed)+len(encoded) > maxPayload {
-				// Send what we have, start new batch with this frame
+				// Batch is full — send it and save this frame for next tick
 				if len(packed) > 0 {
 					t.sendData(packed)
+					// Re-queue the frame that didn't fit (non-blocking)
+					select {
+					case t.sendQueue <- frame:
+					default:
+					}
+					return // Only 1 sendData per tick
 				}
 				packed = encoded
 			} else {
@@ -328,21 +339,16 @@ func (t *Transport) sendPendingFrames() {
 	}
 doneQueue:
 
-	// Only check retransmits and ACKs if there was nothing new to send.
-	if !hasNew {
+	// If nothing from queue, check retransmits and ACKs
+	if len(packed) == 0 {
 		t.mu.RLock()
 		for _, s := range t.streams {
-			frames := s.getPendingFrames()
-			for _, f := range frames {
+			for _, f := range s.getPendingFrames() {
 				encoded := encodeTransportFrame(f)
 				if len(packed)+len(encoded) > maxPayload {
-					if len(packed) > 0 {
-						t.sendData(packed)
-					}
-					packed = encoded
-				} else {
-					packed = append(packed, encoded...)
+					break // Don't overflow
 				}
+				packed = append(packed, encoded...)
 			}
 		}
 		t.mu.RUnlock()
