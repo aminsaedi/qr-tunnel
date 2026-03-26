@@ -10,8 +10,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/aminsaedi/qr-tunnel/internal/bitmap"
 	"github.com/aminsaedi/qr-tunnel/internal/provider"
-	"github.com/aminsaedi/qr-tunnel/internal/qr"
 )
 
 // Frame flags
@@ -91,7 +91,8 @@ func decodeTransportFrame(data []byte) (*transportFrame, error) {
 
 // Config holds transport layer configuration.
 type Config struct {
-	QRConfig      qr.EncoderConfig
+	BitmapConfig  bitmap.Config
+	FPS           int           // send-loop tick rate (default 15)
 	WindowSize    int           // sliding window in KB (default 32)
 	RetransmitMin time.Duration // minimum retransmit timeout (default 1s)
 	AckInterval   time.Duration // ACK interval (default 200ms)
@@ -99,19 +100,21 @@ type Config struct {
 
 func DefaultConfig() Config {
 	return Config{
-		QRConfig:      qr.DefaultEncoderConfig(),
+		BitmapConfig:  bitmap.DefaultConfig(),
+		FPS:           15,
 		WindowSize:    32,
 		RetransmitMin: 1 * time.Second,
 		AckInterval:   200 * time.Millisecond,
 	}
 }
 
-// Transport provides reliable multiplexed streams over a QR channel.
+// Transport provides reliable multiplexed streams over a bitmap channel.
 type Transport struct {
 	provider    provider.CallProvider
-	encoder     *qr.Encoder
-	decoder     *qr.Decoder
+	encoder     *bitmap.Encoder
+	decoder     *bitmap.Decoder
 	config      Config
+	seqNum      uint16
 	streams     map[uint16]*Stream
 	mu          sync.RWMutex
 	sendQueue   chan *transportFrame
@@ -130,7 +133,8 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	ctx, cancel := context.WithCancel(context.Background())
 	t := &Transport{
 		provider:    p,
-		encoder:     qr.NewEncoder(config.QRConfig),
+		encoder:     bitmap.NewEncoder(config.BitmapConfig),
+		decoder:     bitmap.NewDecoder(config.BitmapConfig),
 		config:      config,
 		streams:     make(map[uint16]*Stream),
 		sendQueue:   make(chan *transportFrame, 256),
@@ -140,20 +144,30 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	}
 	t.RTTEstimate.Store(int64(500 * time.Millisecond))
 
-	// Set up QR decoder for incoming data
-	t.decoder = qr.NewDecoder(func(sessionID uint32, data []byte) {
-		t.handleIncomingData(data)
-	})
-
-	// Wire up frame callbacks
+	// Wire up frame callbacks — decode bitmap frames directly
 	p.OnFrame(func(f *provider.Frame) {
-		t.decoder.ProcessFrame(f.Image)
+		_, payload, err := t.decoder.DecodeFrame(f.Image)
+		if err != nil {
+			return
+		}
+		if payload != nil {
+			t.handleIncomingData(payload)
+		}
 	})
 
 	// Start send loop
 	go t.sendLoop()
 
 	return t
+}
+
+// nextSeq returns the next bitmap sequence number.
+func (t *Transport) nextSeq() uint16 {
+	t.mu.Lock()
+	seq := t.seqNum
+	t.seqNum++
+	t.mu.Unlock()
+	return seq
 }
 
 // OpenStream creates a new outgoing stream with an optional SYN payload.
@@ -194,7 +208,7 @@ func (t *Transport) Close() {
 	t.mu.Unlock()
 }
 
-// handleIncomingData processes reassembled data from the QR decoder.
+// handleIncomingData processes reassembled data from the bitmap decoder.
 // The data may contain one or more packed transport frames.
 func (t *Transport) handleIncomingData(data []byte) {
 	offset := 0
@@ -202,7 +216,7 @@ func (t *Transport) handleIncomingData(data []byte) {
 		if len(data)-offset < transportHeaderSize {
 			break
 		}
-		// Stop at zero-padding from LT decoder (flags=0, streamID=0)
+		// Stop at zero-padding (flags=0, streamID=0)
 		if data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 {
 			break
 		}
@@ -289,12 +303,12 @@ func (t *Transport) handleFrame(f *transportFrame) {
 	}
 }
 
-// sendLoop pulls frames from the send queue and encodes them into QR frames.
-// Only sends 1 QR frame per tick to give each frame time on the canvas.
+// sendLoop pulls frames from the send queue and encodes them into bitmap frames.
+// Only sends 1 bitmap frame per tick to give each frame time on the canvas.
 func (t *Transport) sendLoop() {
-	// Tick at half the FPS rate — each QR stays on screen for 2 video frames
+	// Tick at half the FPS rate — each bitmap stays on screen for 2 video frames
 	// This gives the other side's capture more time to read each code
-	interval := time.Second / time.Duration(t.config.QRConfig.FPS) * 2
+	interval := time.Second / time.Duration(t.config.FPS) * 2
 	if interval < 100*time.Millisecond {
 		interval = 100 * time.Millisecond
 	}
@@ -312,9 +326,9 @@ func (t *Transport) sendLoop() {
 }
 
 func (t *Transport) sendPendingFrames() {
-	// Pack frames greedily up to chunk size, but only send ONE QR per tick.
-	// This gives each QR frame time on the canvas for the other side to capture.
-	maxPayload := t.config.QRConfig.ChunkSize
+	// Pack frames greedily up to bitmap max payload, but only send ONE frame per tick.
+	// This gives each bitmap frame time on the canvas for the other side to capture.
+	maxPayload := t.config.BitmapConfig.MaxPayloadBytes()
 	var packed []byte
 
 	// Take frames from the queue (prioritize new data)
@@ -364,36 +378,19 @@ doneQueue:
 }
 
 func (t *Transport) sendData(data []byte) {
-	// Encode the packed transport frames into QR and send via provider.
-	// We send exactly 1 QR frame per call. The draw loop continuously
-	// redraws the current frame (__goFrame), so the receiver captures it
-	// multiple times from the video feed — no need to burst duplicates.
-	ctx, cancel := context.WithTimeout(t.ctx, time.Second)
-	defer cancel()
-
-	frames, err := t.encoder.Encode(ctx, data)
-	if err != nil {
+	// Encode the packed transport frames into a bitmap and send via provider.
+	img := t.encoder.EncodePacket(t.nextSeq(), data)
+	if img == nil {
 		return
 	}
 
-	// Take the first encoded frame and send it once.
-	select {
-	case frame, ok := <-frames:
-		if !ok {
-			return
-		}
-		if err := t.provider.SendFrame(&provider.Frame{
-			Image:  frame,
-			Width:  t.config.QRConfig.FrameWidth,
-			Height: t.config.QRConfig.FrameHeight,
-		}); err == nil {
-			t.BytesSent.Add(int64(len(data)))
-		}
-	case <-ctx.Done():
-		return
+	if err := t.provider.SendFrame(&provider.Frame{
+		Image:  img,
+		Width:  bitmap.FrameWidth,
+		Height: bitmap.FrameHeight,
+	}); err == nil {
+		t.BytesSent.Add(int64(len(data)))
 	}
-	// Cancel the encoder goroutine — we only needed one frame.
-	cancel()
 }
 
 // Metrics returns current transport metrics.
@@ -402,7 +399,7 @@ type Metrics struct {
 	BytesReceived int64
 	RTTEstimate   time.Duration
 	ActiveStreams  int
-	EncoderStats  qr.DecoderStats
+	DecodeRate    float64 // fraction of frames successfully decoded
 }
 
 func (t *Transport) Metrics() Metrics {
@@ -410,11 +407,17 @@ func (t *Transport) Metrics() Metrics {
 	activeStreams := len(t.streams)
 	t.mu.RUnlock()
 
+	var decodeRate float64
+	processed := t.decoder.FramesProcessed.Load()
+	if processed > 0 {
+		decodeRate = float64(t.decoder.FramesDecoded.Load()) / float64(processed)
+	}
+
 	return Metrics{
 		BytesSent:     t.BytesSent.Load(),
 		BytesReceived: t.BytesReceived.Load(),
 		RTTEstimate:   time.Duration(t.RTTEstimate.Load()),
 		ActiveStreams:  activeStreams,
-		EncoderStats:  t.decoder.Stats(),
+		DecodeRate:    decodeRate,
 	}
 }

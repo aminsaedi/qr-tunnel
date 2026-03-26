@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aminsaedi/qr-tunnel/internal/bitmap"
 	"github.com/aminsaedi/qr-tunnel/internal/httpproxy"
 	"github.com/aminsaedi/qr-tunnel/internal/provider"
 	baleProvider "github.com/aminsaedi/qr-tunnel/internal/provider/bale"
 	webrtcProvider "github.com/aminsaedi/qr-tunnel/internal/provider/webrtc"
-	"github.com/aminsaedi/qr-tunnel/internal/qr"
 	"github.com/aminsaedi/qr-tunnel/internal/socks5"
 	"github.com/aminsaedi/qr-tunnel/internal/transport"
 	"github.com/aminsaedi/qr-tunnel/internal/tui"
@@ -51,7 +51,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Fprintf(os.Stderr, `qr-tunnel %s — TCP tunnel over video calls using QR codes
+	fmt.Fprintf(os.Stderr, `qr-tunnel %s — TCP tunnel over video calls using bitmap codec
 
 Usage:
   qr-tunnel client      [flags]  Client mode (SOCKS5 proxy + TUI)
@@ -62,14 +62,13 @@ Usage:
   qr-tunnel version              Show version
 
 Common Flags:
-  --signaling    Signaling server URL (default: ws://localhost:3000)
-  --role         caller|callee (default: callee)
-  --gui          Enable web UI at address (e.g., :8080)
-  --fps          QR frames per second (default: 15)
-  --qr-version   QR version 1-40 (default: 25)
-  --ecc          Error correction L|M|Q|H (default: M)
-  --chunk-size   Bytes per LT block (default: 800)
-  --log          Log level: debug|info|warn (default: info)
+  --signaling       Signaling server URL (default: ws://localhost:3000)
+  --role            caller|callee (default: callee)
+  --gui             Enable web UI at address (e.g., :8080)
+  --fps             Frames per second for send loop (default: 15)
+  --block-size      Bitmap block size in pixels (default: 16)
+  --bits-per-block  Bits per block 1|2 (default: 2)
+  --log             Log level: debug|info|warn (default: info)
 
 Client-only Flags:
   --socks5       SOCKS5 listen address (default: :1080)
@@ -78,14 +77,13 @@ Client-only Flags:
 }
 
 type commonFlags struct {
-	signaling  string
-	role       string
-	gui        string
-	fps        int
-	qrVersion  int
-	ecc        string
-	chunkSize  int
-	logLevel   string
+	signaling    string
+	role         string
+	gui          string
+	fps          int
+	blockSize    int
+	bitsPerBlock int
+	logLevel     string
 }
 
 func addCommonFlags(fs *flag.FlagSet) *commonFlags {
@@ -93,22 +91,17 @@ func addCommonFlags(fs *flag.FlagSet) *commonFlags {
 	fs.StringVar(&f.signaling, "signaling", "ws://localhost:3000", "signaling server URL")
 	fs.StringVar(&f.role, "role", "callee", "caller or callee")
 	fs.StringVar(&f.gui, "gui", "", "web UI listen address (e.g., :8080)")
-	fs.IntVar(&f.fps, "fps", 15, "QR frames per second")
-	fs.IntVar(&f.qrVersion, "qr-version", 25, "QR version 1-40")
-	fs.StringVar(&f.ecc, "ecc", "M", "error correction level L|M|Q|H")
-	fs.IntVar(&f.chunkSize, "chunk-size", 800, "bytes per LT block")
+	fs.IntVar(&f.fps, "fps", 15, "send loop frames per second")
+	fs.IntVar(&f.blockSize, "block-size", 16, "bitmap block size in pixels")
+	fs.IntVar(&f.bitsPerBlock, "bits-per-block", 2, "bits per block (1 or 2)")
 	fs.StringVar(&f.logLevel, "log", "info", "log level: debug|info|warn")
 	return f
 }
 
-func (f *commonFlags) qrConfig() qr.EncoderConfig {
-	return qr.EncoderConfig{
-		Version:         f.qrVersion,
-		ErrorCorrection: f.ecc,
-		ChunkSize:       f.chunkSize,
-		FPS:             f.fps,
-		FrameWidth:      720,
-		FrameHeight:     720,
+func (f *commonFlags) bitmapConfig() bitmap.Config {
+	return bitmap.Config{
+		BlockSize:    f.blockSize,
+		BitsPerBlock: f.bitsPerBlock,
 	}
 }
 
@@ -124,10 +117,10 @@ func runClient(args []string) {
 	metrics := tui.NewMetricsSource()
 	metrics.SignalingURL.Store(cf.signaling)
 	metrics.SOCKS5Addr.Store(*socksAddr)
-	metrics.QRVersion.Store(int32(cf.qrVersion))
-	metrics.ECC.Store(cf.ecc)
+	metrics.QRVersion.Store(int32(cf.blockSize))
+	metrics.ECC.Store(fmt.Sprintf("%dbpp", cf.bitsPerBlock))
 	metrics.FPS.Store(int32(cf.fps))
-	metrics.ChunkSize.Store(int32(cf.chunkSize))
+	metrics.ChunkSize.Store(int32(cf.bitmapConfig().MaxPayloadBytes()))
 
 	// Create provider
 	p := webrtcProvider.NewWebRTCProvider()
@@ -144,7 +137,8 @@ func runClient(args []string) {
 
 	// Create transport
 	tConfig := transport.DefaultConfig()
-	tConfig.QRConfig = cf.qrConfig()
+	tConfig.BitmapConfig = cf.bitmapConfig()
+	tConfig.FPS = cf.fps
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 
@@ -186,10 +180,10 @@ func runServer(args []string) {
 	// Initialize metrics
 	metrics := tui.NewMetricsSource()
 	metrics.SignalingURL.Store(cf.signaling)
-	metrics.QRVersion.Store(int32(cf.qrVersion))
-	metrics.ECC.Store(cf.ecc)
+	metrics.QRVersion.Store(int32(cf.blockSize))
+	metrics.ECC.Store(fmt.Sprintf("%dbpp", cf.bitsPerBlock))
 	metrics.FPS.Store(int32(cf.fps))
-	metrics.ChunkSize.Store(int32(cf.chunkSize))
+	metrics.ChunkSize.Store(int32(cf.bitmapConfig().MaxPayloadBytes()))
 
 	// Create provider
 	p := webrtcProvider.NewWebRTCProvider()
@@ -206,7 +200,8 @@ func runServer(args []string) {
 
 	// Create transport
 	tConfig := transport.DefaultConfig()
-	tConfig.QRConfig = cf.qrConfig()
+	tConfig.BitmapConfig = cf.bitmapConfig()
+	tConfig.FPS = cf.fps
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 
@@ -280,17 +275,17 @@ func runConnect(args []string) {
 	if *testFrames {
 		go func() {
 			log.Println("[tx] sending test frames at 15fps")
-			enc := qr.NewEncoder(cf.qrConfig())
+			enc := bitmap.NewEncoder(cf.bitmapConfig())
 			ticker := time.NewTicker(time.Second / 15)
 			defer ticker.Stop()
-			n := 0
+			var n uint16
 			for range ticker.C {
 				n++
-				frame, err := enc.EncodeFrame([]byte(fmt.Sprintf("test-frame-%d", n)))
-				if err != nil {
+				frame := enc.EncodePacket(n, []byte(fmt.Sprintf("test-frame-%d", n)))
+				if frame == nil {
 					continue
 				}
-				if err := p.SendFrame(&provider.Frame{Image: frame, Width: 720, Height: 720}); err != nil {
+				if err := p.SendFrame(&provider.Frame{Image: frame, Width: bitmap.FrameWidth, Height: bitmap.FrameHeight}); err != nil {
 					if n%30 == 1 {
 						log.Printf("[tx] error: %v", err)
 					}
@@ -333,7 +328,7 @@ func updateMetrics(metrics *tui.MetricsSource, tr *transport.Transport, socksSer
 
 		metrics.ActiveStreams.Store(int32(m.ActiveStreams))
 		metrics.RTTEstimate.Store(m.RTTEstimate)
-		metrics.DecodeOK.Store(m.EncoderStats.SuccessRate)
+		metrics.DecodeOK.Store(m.DecodeRate)
 
 		if socksServer != nil {
 			metrics.ActiveConns.Store(socksServer.ActiveConns.Load())
@@ -348,10 +343,9 @@ func runBaleClient(args []string) {
 	bridge := fs.String("bridge", "ws://localhost:9000", "browser bridge WebSocket URL")
 	socksAddr := fs.String("socks5", ":1080", "SOCKS5 listen address")
 	httpAddr := fs.String("http", ":8080", "HTTP CONNECT proxy address (for Telegram)")
-	fps := fs.Int("fps", 15, "QR frames per second")
-	qrVersion := fs.Int("qr-version", 20, "QR version")
-	ecc := fs.String("ecc", "M", "error correction level")
-	chunkSize := fs.Int("chunk-size", 400, "bytes per LT block")
+	fps := fs.Int("fps", 15, "send loop frames per second")
+	blockSize := fs.Int("block-size", 16, "bitmap block size in pixels")
+	bitsPerBlock := fs.Int("bits-per-block", 2, "bits per block (1 or 2)")
 	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -370,14 +364,11 @@ func runBaleClient(args []string) {
 
 	// Create transport
 	tConfig := transport.DefaultConfig()
-	tConfig.QRConfig = qr.EncoderConfig{
-		Version:         *qrVersion,
-		ErrorCorrection: *ecc,
-		ChunkSize:       *chunkSize,
-		FPS:             *fps,
-		FrameWidth:      720,
-		FrameHeight:     720,
+	tConfig.BitmapConfig = bitmap.Config{
+		BlockSize:    *blockSize,
+		BitsPerBlock: *bitsPerBlock,
 	}
+	tConfig.FPS = *fps
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 
@@ -412,10 +403,9 @@ func runBaleClient(args []string) {
 func runBaleServer(args []string) {
 	fs := flag.NewFlagSet("bale-server", flag.ExitOnError)
 	bridge := fs.String("bridge", "ws://localhost:9001", "browser bridge WebSocket URL")
-	fps := fs.Int("fps", 15, "QR frames per second")
-	qrVersion := fs.Int("qr-version", 20, "QR version")
-	ecc := fs.String("ecc", "M", "error correction level")
-	chunkSize := fs.Int("chunk-size", 400, "bytes per LT block")
+	fps := fs.Int("fps", 15, "send loop frames per second")
+	blockSize := fs.Int("block-size", 16, "bitmap block size in pixels")
+	bitsPerBlock := fs.Int("bits-per-block", 2, "bits per block (1 or 2)")
 	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -434,14 +424,11 @@ func runBaleServer(args []string) {
 
 	// Create transport
 	tConfig := transport.DefaultConfig()
-	tConfig.QRConfig = qr.EncoderConfig{
-		Version:         *qrVersion,
-		ErrorCorrection: *ecc,
-		ChunkSize:       *chunkSize,
-		FPS:             *fps,
-		FrameWidth:      720,
-		FrameHeight:     720,
+	tConfig.BitmapConfig = bitmap.Config{
+		BlockSize:    *blockSize,
+		BitsPerBlock: *bitsPerBlock,
 	}
+	tConfig.FPS = *fps
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 

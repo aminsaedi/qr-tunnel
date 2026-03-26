@@ -87,7 +87,7 @@ func (s *Stream) Write(data []byte) (int, error) {
 	}
 
 	// Fragment into chunks
-	maxChunk := 350 // Must fit in one QR frame with transport header (15 bytes)
+	maxChunk := 400 // Must fit in one bitmap frame with transport header overhead
 	written := 0
 
 	for written < len(data) {
