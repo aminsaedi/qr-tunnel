@@ -236,7 +236,19 @@ func (s *Server) handleServerStream(stream *transport.Stream) {
 	}
 
 	dst := string(synPayload)
-	log.Printf("[socks5-server] dialing %s for stream %d", dst, stream.ID)
+	log.Printf("[socks5-server] stream %d: waiting for first data before dialing %s", stream.ID, dst)
+
+	// Wait for first actual data from the client (e.g., TLS ClientHello).
+	// This ensures the target server receives data immediately after we connect,
+	// preventing TLS timeouts.
+	firstBuf := make([]byte, 4096)
+	n, err := stream.Read(firstBuf)
+	if err != nil || n == 0 {
+		log.Printf("[socks5-server] stream %d: no data: %v", stream.ID, err)
+		return
+	}
+	firstData := firstBuf[:n]
+	log.Printf("[socks5-server] stream %d: got %d bytes, dialing %s", stream.ID, n, dst)
 
 	conn, err := net.DialTimeout("tcp", dst, 10*time.Second)
 	if err != nil {
@@ -244,6 +256,12 @@ func (s *Server) handleServerStream(stream *transport.Stream) {
 		return
 	}
 	defer conn.Close()
+
+	// Send the buffered first data immediately
+	if _, err := conn.Write(firstData); err != nil {
+		log.Printf("[socks5-server] write first data failed: %v", err)
+		return
+	}
 
 	// Relay bidirectionally
 	var wg sync.WaitGroup

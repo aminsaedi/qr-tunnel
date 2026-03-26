@@ -160,11 +160,6 @@ func (s *Stream) SetSYNPayload(data []byte) {
 
 // ReadSYNPayload reads the metadata received with the SYN.
 func (s *Stream) ReadSYNPayload() []byte {
-	s.recvMu.Lock()
-	defer s.recvMu.Unlock()
-	if s.recvBuf.Len() > 0 {
-		return s.recvBuf.Bytes()
-	}
 	return s.synPayload
 }
 

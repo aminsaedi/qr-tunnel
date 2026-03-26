@@ -73,6 +73,8 @@ func decodeTransportFrame(data []byte) (*transportFrame, error) {
 	binary.BigEndian.PutUint32(frameCopy[15:19], storedCRC)
 
 	if storedCRC != computedCRC {
+		log.Printf("[transport] CRC FAIL: stored=%08x computed=%08x flags=0x%02x stream=%d payloadLen=%d totalLen=%d",
+			storedCRC, computedCRC, data[0], binary.BigEndian.Uint16(data[1:3]), payloadLen, totalLen)
 		return nil, fmt.Errorf("CRC mismatch: stored=%08x computed=%08x", storedCRC, computedCRC)
 	}
 
@@ -196,19 +198,20 @@ func (t *Transport) Close() {
 // The data may contain one or more packed transport frames.
 func (t *Transport) handleIncomingData(data []byte) {
 	offset := 0
-	parsed := 0
 	for offset < len(data) {
 		if len(data)-offset < transportHeaderSize {
 			break
 		}
+		// Stop at zero-padding from LT decoder (flags=0, streamID=0)
+		if data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 {
+			break
+		}
 		frame, err := decodeTransportFrame(data[offset:])
 		if err != nil {
-			// CRC failure or corrupt frame — skip remaining data
 			break
 		}
 		offset += transportHeaderSize + len(frame.Payload)
-		parsed++
-		if frame.Flags != 0 { // Don't log zero-padding frames
+		if frame.Flags != 0 {
 			log.Printf("[transport] rx: flags=0x%02x stream=%d seq=%d ack=%d payload=%d",
 				frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload))
 		}
@@ -236,9 +239,10 @@ func (t *Transport) handleFrame(f *transportFrame) {
 			WindowSize: uint16(t.config.WindowSize),
 		}
 
-		// Deliver the SYN payload (connection metadata like dst host:port)
+		// Store the SYN payload as connection metadata (not in recvBuf)
 		if len(f.Payload) > 0 {
-			stream.recvBuf.Write(f.Payload)
+			stream.synPayload = make([]byte, len(f.Payload))
+			copy(stream.synPayload, f.Payload)
 		}
 
 		select {

@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/aminsaedi/qr-tunnel/internal/httpproxy"
 	"github.com/aminsaedi/qr-tunnel/internal/provider"
 	baleProvider "github.com/aminsaedi/qr-tunnel/internal/provider/bale"
 	webrtcProvider "github.com/aminsaedi/qr-tunnel/internal/provider/webrtc"
@@ -346,6 +347,7 @@ func runBaleClient(args []string) {
 	fs := flag.NewFlagSet("bale-client", flag.ExitOnError)
 	bridge := fs.String("bridge", "ws://localhost:9000", "browser bridge WebSocket URL")
 	socksAddr := fs.String("socks5", ":1080", "SOCKS5 listen address")
+	httpAddr := fs.String("http", ":8080", "HTTP CONNECT proxy address (for Telegram)")
 	fps := fs.Int("fps", 15, "QR frames per second")
 	qrVersion := fs.Int("qr-version", 20, "QR version")
 	ecc := fs.String("ecc", "M", "error correction level")
@@ -354,7 +356,7 @@ func runBaleClient(args []string) {
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
 	log.Printf("qr-tunnel %s — Bale client mode", Version)
-	log.Printf("bridge: %s, socks5: %s", *bridge, *socksAddr)
+	log.Printf("bridge: %s, socks5: %s, http: %s", *bridge, *socksAddr, *httpAddr)
 
 	p := baleProvider.NewBaleProvider()
 	p.OnState(func(state provider.State) {
@@ -385,8 +387,21 @@ func runBaleClient(args []string) {
 		log.Fatalf("socks5 start failed: %v", err)
 	}
 	defer socksServer.Close()
-	log.Printf("[socks5] SOCKS proxy listening on %s", *socksAddr)
-	log.Printf("[socks5] Test: curl --socks5 localhost%s https://httpbin.org/ip", *socksAddr)
+	log.Printf("[socks5] SOCKS proxy on %s", *socksAddr)
+
+	// Start HTTP CONNECT proxy (for Telegram compatibility)
+	httpServer := httpproxy.NewServer(tr)
+	if err := httpServer.Start(*httpAddr); err != nil {
+		log.Fatalf("http proxy start failed: %v", err)
+	}
+	defer httpServer.Close()
+	log.Printf("[http-proxy] HTTP CONNECT proxy on %s", *httpAddr)
+
+	log.Println("")
+	log.Println("=== PROXY READY ===")
+	log.Printf("  SOCKS5: localhost%s", *socksAddr)
+	log.Printf("  HTTP:   localhost%s (for Telegram)", *httpAddr)
+	log.Println("")
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
