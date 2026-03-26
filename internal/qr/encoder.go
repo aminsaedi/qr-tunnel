@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"math/rand"
@@ -64,8 +65,9 @@ func NewEncoder(config EncoderConfig) *Encoder {
 // [2B total_source_blocks][2B lt_block_index]
 // [4B lt_block_seed]
 // [2B payload_len]
+// [4B crc32]
 // [N bytes LT-encoded payload]
-const qrHeaderSize = 20
+const qrHeaderSize = 24
 
 func (e *Encoder) buildPayload(lt *LTEncoder, seqNum uint32) []byte {
 	ltIndex, ltSeed, ltData := lt.NextBlock()
@@ -81,7 +83,10 @@ func (e *Encoder) buildPayload(lt *LTEncoder, seqNum uint32) []byte {
 	binary.BigEndian.PutUint16(buf[12:14], uint16(ltIndex))
 	binary.BigEndian.PutUint32(buf[14:18], ltSeed)
 	binary.BigEndian.PutUint16(buf[18:20], uint16(payloadLen))
+	// CRC32 at [20:24] — computed over header (with CRC zeroed) + payload
 	copy(buf[qrHeaderSize:], ltData)
+	checksum := crc32.ChecksumIEEE(buf)
+	binary.BigEndian.PutUint32(buf[20:24], checksum)
 
 	return buf
 }

@@ -3,6 +3,7 @@ package qr
 import (
 	"encoding/base64"
 	"encoding/binary"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"log"
@@ -114,13 +115,25 @@ func (d *Decoder) processPayload(payload []byte) {
 	magic := payload[0]
 	version := payload[1]
 	if magic != 0xAA || version != 0x01 {
-		log.Printf("[qr-decoder] processPayload: bad magic/version: 0x%02x 0x%02x", magic, version)
 		return
 	}
-	log.Printf("[qr-decoder] processPayload: valid header, %d bytes", len(payload))
+
+	// Verify CRC32 (at bytes [20:24])
+	if len(payload) < qrHeaderSize {
+		return
+	}
+	storedCRC := binary.BigEndian.Uint32(payload[20:24])
+	payloadCopy := make([]byte, len(payload))
+	copy(payloadCopy, payload)
+	binary.BigEndian.PutUint32(payloadCopy[20:24], 0) // zero CRC field
+	computedCRC := crc32.ChecksumIEEE(payloadCopy)
+	if storedCRC != computedCRC {
+		// Corrupted QR data — silently drop
+		d.FramesFailed.Add(1)
+		return
+	}
 
 	sessionID := binary.BigEndian.Uint32(payload[2:6])
-	// seqNum := binary.BigEndian.Uint32(payload[6:10])
 	totalSourceBlocks := binary.BigEndian.Uint16(payload[10:12])
 	ltBlockIndex := binary.BigEndian.Uint16(payload[12:14])
 	ltBlockSeed := binary.BigEndian.Uint32(payload[14:18])

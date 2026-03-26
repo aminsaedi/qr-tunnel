@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -23,8 +24,8 @@ const (
 )
 
 // transportFrame is the wire format for a single transport frame.
-// [1B flags][2B stream_id][4B seq_num][4B ack_num][2B window_size][2B payload_len][N payload]
-const transportHeaderSize = 15
+// [1B flags][2B stream_id][4B seq_num][4B ack_num][2B window_size][2B payload_len][4B crc32][N payload]
+const transportHeaderSize = 19
 
 type transportFrame struct {
 	Flags      byte
@@ -43,7 +44,11 @@ func encodeTransportFrame(f *transportFrame) []byte {
 	binary.BigEndian.PutUint32(buf[7:11], f.AckNum)
 	binary.BigEndian.PutUint16(buf[11:13], f.WindowSize)
 	binary.BigEndian.PutUint16(buf[13:15], uint16(len(f.Payload)))
+	// CRC32 placeholder at [15:19] — computed below
 	copy(buf[transportHeaderSize:], f.Payload)
+	// Compute CRC32 over the entire frame (with CRC field zeroed)
+	checksum := crc32.ChecksumIEEE(buf)
+	binary.BigEndian.PutUint32(buf[15:19], checksum)
 	return buf
 }
 
@@ -51,6 +56,26 @@ func decodeTransportFrame(data []byte) (*transportFrame, error) {
 	if len(data) < transportHeaderSize {
 		return nil, fmt.Errorf("frame too short: %d", len(data))
 	}
+	payloadLen := binary.BigEndian.Uint16(data[13:15])
+	totalLen := transportHeaderSize + int(payloadLen)
+	if totalLen > len(data) {
+		return nil, fmt.Errorf("payload length mismatch: need %d have %d", totalLen, len(data))
+	}
+
+	// Verify CRC32
+	storedCRC := binary.BigEndian.Uint32(data[15:19])
+	// Zero out the CRC field for computation
+	frameCopy := make([]byte, totalLen)
+	copy(frameCopy, data[:totalLen])
+	binary.BigEndian.PutUint32(frameCopy[15:19], 0)
+	computedCRC := crc32.ChecksumIEEE(frameCopy)
+	// Re-insert stored CRC for computation (we zeroed it)
+	binary.BigEndian.PutUint32(frameCopy[15:19], storedCRC)
+
+	if storedCRC != computedCRC {
+		return nil, fmt.Errorf("CRC mismatch: stored=%08x computed=%08x", storedCRC, computedCRC)
+	}
+
 	f := &transportFrame{
 		Flags:      data[0],
 		StreamID:   binary.BigEndian.Uint16(data[1:3]),
@@ -58,11 +83,7 @@ func decodeTransportFrame(data []byte) (*transportFrame, error) {
 		AckNum:     binary.BigEndian.Uint32(data[7:11]),
 		WindowSize: binary.BigEndian.Uint16(data[11:13]),
 	}
-	payloadLen := binary.BigEndian.Uint16(data[13:15])
-	if int(payloadLen) > len(data)-transportHeaderSize {
-		return nil, fmt.Errorf("payload length mismatch")
-	}
-	f.Payload = data[transportHeaderSize : transportHeaderSize+int(payloadLen)]
+	f.Payload = data[transportHeaderSize:totalLen]
 	return f, nil
 }
 
@@ -174,21 +195,23 @@ func (t *Transport) Close() {
 // handleIncomingData processes reassembled data from the QR decoder.
 // The data may contain one or more packed transport frames.
 func (t *Transport) handleIncomingData(data []byte) {
-	log.Printf("[transport] handleIncomingData: %d bytes", len(data))
 	offset := 0
+	parsed := 0
 	for offset < len(data) {
 		if len(data)-offset < transportHeaderSize {
-			log.Printf("[transport] remaining %d bytes < header %d, stopping", len(data)-offset, transportHeaderSize)
 			break
 		}
 		frame, err := decodeTransportFrame(data[offset:])
 		if err != nil {
-			log.Printf("[transport] decodeFrame error at offset %d: %v", offset, err)
+			// CRC failure or corrupt frame — skip remaining data
 			break
 		}
-		log.Printf("[transport] frame: flags=0x%02x stream=%d seq=%d ack=%d payload=%d",
-			frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload))
 		offset += transportHeaderSize + len(frame.Payload)
+		parsed++
+		if frame.Flags != 0 { // Don't log zero-padding frames
+			log.Printf("[transport] rx: flags=0x%02x stream=%d seq=%d ack=%d payload=%d",
+				frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload))
+		}
 		t.handleFrame(frame)
 	}
 }

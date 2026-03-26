@@ -178,11 +178,15 @@ func (s *Server) handleConn(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
 
 	// Open a transport stream with destination as SYN payload
+	// Use sequential IDs starting from 1 (avoid 0 which is used for control)
 	streamID := uint16(s.nextID.Add(1))
+	if streamID == 0 {
+		streamID = uint16(s.nextID.Add(1)) // skip 0
+	}
 	stream := s.transport.OpenStream(streamID, []byte(dst))
 
-	// Wait for stream to open
-	if err := stream.WaitOpen(60 * time.Second); err != nil {
+	// Wait for stream to open — longer timeout for QR video pipeline
+	if err := stream.WaitOpen(90 * time.Second); err != nil {
 		log.Printf("[socks5] stream open failed: %v", err)
 		sendReply(conn, repHostUnreachable, nil, 0)
 		stream.Close()
