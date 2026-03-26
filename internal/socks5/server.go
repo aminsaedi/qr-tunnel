@@ -177,12 +177,9 @@ func (s *Server) handleConn(conn net.Conn) {
 	// Clear deadline for data relay
 	_ = conn.SetDeadline(time.Time{})
 
-	// Open a transport stream
+	// Open a transport stream with destination as SYN payload
 	streamID := uint16(s.nextID.Add(1))
-	stream := s.transport.OpenStream(streamID)
-
-	// Send destination info as SYN payload
-	stream.SetSYNPayload([]byte(dst))
+	stream := s.transport.OpenStream(streamID, []byte(dst))
 
 	// Wait for stream to open
 	if err := stream.WaitOpen(60 * time.Second); err != nil {

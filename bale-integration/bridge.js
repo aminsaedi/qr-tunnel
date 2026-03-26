@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// QR Tunnel — Bale Browser Bridge v3
-// Strategy: Use Chrome's fake camera for call setup, then replaceTrack with QR canvas
+// QR Tunnel — Bale Browser Bridge v4
+// Strategy: Intercept getUserMedia, pipe camera through canvas transform, return modified stream
 const { chromium } = require('playwright');
 const { WebSocketServer } = require('ws');
 const path = require('path');
@@ -18,16 +18,14 @@ console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort}`);
 
 let goSocket = null, page = null, callActive = false;
 
-// --- WS server for Go binary ---
+// --- WS server ---
 const wss = new WebSocketServer({ port: wsPort });
 console.log(`[bridge] WS on :${wsPort}`);
 wss.on('connection', ws => {
-  console.log('[bridge] Go binary connected');
+  console.log('[bridge] Go connected');
   goSocket = ws;
   if (callActive) ws.send('connected');
-  ws.on('message', data => {
-    if (data instanceof Buffer && data.length > 8) drawQRFrame(data);
-  });
+  ws.on('message', data => { if (data instanceof Buffer && data.length > 8) drawQRFrame(data); });
   ws.on('close', () => { goSocket = null; });
 });
 
@@ -43,200 +41,187 @@ async function drawQRFrame(data) {
   if (!page) return;
   try {
     const b64 = data.slice(8).toString('base64');
-    // Wait for the image to actually load before returning
-    const result = await page.evaluate(async (b64) => {
-      return new Promise((resolve) => {
+    await page.evaluate(async (b64) => {
+      return new Promise(resolve => {
         const img = new Image();
-        img.onload = () => {
-          window.__goFrame = img;
-          window.__goFrameCount = (window.__goFrameCount || 0) + 1;
-          resolve({ ok: true, goFrameCount: window.__goFrameCount });
-        };
-        img.onerror = (e) => {
-          window.__goFrameErrors = (window.__goFrameErrors || 0) + 1;
-          resolve({ error: 'image load failed', errors: window.__goFrameErrors });
-        };
+        img.onload = () => { window.__goFrame = img; resolve(true); };
+        img.onerror = () => resolve(false);
         img.src = 'data:image/jpeg;base64,' + b64;
-        // Timeout fallback
-        setTimeout(() => resolve({ error: 'timeout', goFrameCount: window.__goFrameCount || 0 }), 3000);
+        setTimeout(() => resolve(false), 2000);
       });
     }, b64);
-    txCount++;
-    if (txCount % 5 === 1) {
-      console.log(`[bridge] tx→canvas #${txCount}: ${JSON.stringify(result)}`);
-    }
-  } catch(e) {
-    console.log(`[bridge] drawQRFrame error: ${e.message}`);
-  }
+    if (++txCount % 5 === 1) console.log(`[bridge] tx→canvas #${txCount}`);
+  } catch {}
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // --- INIT SCRIPT ---
-// Only hooks addTrack prototype and sets up canvas/replaceTrack AFTER call starts.
-// The camera feed comes from Chrome's --use-file-for-fake-video-capture flag.
+// Key insight: Instead of replaceTrack, we intercept getUserMedia and return
+// a TRANSFORMED stream. The camera frames pass through our canvas where we
+// can draw QR codes on top. LiveKit gets this stream from the start.
 const INIT_SCRIPT = `
 (function() {
   window.__goFrame = null;
   window.__qrCanvas = null;
   window.__qrCtx = null;
-  window.__qrStream = null;
-  window.__videoSenders = [];
-  window.__trackReplaced = false;
+  window.__frameN = 0;
 
-  // Hook addTrack AND addTransceiver on prototype — catches ALL PCs
-  const origAddTrack = RTCPeerConnection.prototype.addTrack;
-  RTCPeerConnection.prototype.addTrack = function(track, ...streams) {
-    const sender = origAddTrack.call(this, track, ...streams);
-    if (track.kind === 'video') {
-      window.__videoSenders.push(sender);
-      console.log('[qr] video sender via addTrack #' + window.__videoSenders.length);
-    }
-    return sender;
-  };
+  const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
 
-  const origAddTransceiver = RTCPeerConnection.prototype.addTransceiver;
-  RTCPeerConnection.prototype.addTransceiver = function(trackOrKind, init) {
-    const transceiver = origAddTransceiver.call(this, trackOrKind, init);
-    const kind = typeof trackOrKind === 'string' ? trackOrKind : trackOrKind?.kind;
-    if (kind === 'video' && transceiver.sender) {
-      window.__videoSenders.push(transceiver.sender);
-      console.log('[qr] video sender via addTransceiver #' + window.__videoSenders.length);
-    }
-    return transceiver;
-  };
+  navigator.mediaDevices.getUserMedia = async function(constraints) {
+    console.log('[qr] getUserMedia:', JSON.stringify(constraints));
 
-  // Also hook getSenders to discover senders after the fact
-  const origGetSenders = RTCPeerConnection.prototype.getSenders;
-  RTCPeerConnection.prototype.getSenders = function() {
-    const senders = origGetSenders.call(this);
-    for (const s of senders) {
-      if (s.track?.kind === 'video' && !window.__videoSenders.includes(s)) {
-        window.__videoSenders.push(s);
-        console.log('[qr] video sender via getSenders #' + window.__videoSenders.length);
-      }
-    }
-    return senders;
-  };
+    if (!constraints?.video) return origGUM(constraints);
 
-  // Setup QR canvas and replace video track on all senders
-  window.__setupAndReplace = async function() {
-    if (window.__trackReplaced) return 'already replaced';
+    // Get the real camera stream (fake Y4M camera via Chrome flag)
+    const realStream = await origGUM(constraints);
+    const realVideoTrack = realStream.getVideoTracks()[0];
 
-    // Create canvas
+    if (!realVideoTrack) return realStream;
+
+    console.log('[qr] Intercepting video track, creating canvas transform pipeline');
+
+    // Create canvas for drawing
     if (!window.__qrCanvas) {
       const c = document.createElement('canvas');
       c.width = 720; c.height = 720;
       c.style.cssText = 'position:fixed;bottom:5px;right:5px;width:100px;height:100px;z-index:999999;border:2px solid lime;';
-      document.body.appendChild(c);
+      document.body?.appendChild(c);
       window.__qrCanvas = c;
       window.__qrCtx = c.getContext('2d');
-      window.__qrCtx.fillStyle = '#fff';
-      window.__qrCtx.fillRect(0, 0, 720, 720);
+    }
 
-      // Wait for render
+    // Use MediaStreamTrackProcessor to read frames from the real camera,
+    // transform them through our canvas, and output via MediaStreamTrackGenerator
+    if (typeof MediaStreamTrackProcessor !== 'undefined' && typeof MediaStreamTrackGenerator !== 'undefined') {
+      console.log('[qr] Using TransformStream pipeline (MediaStreamTrackProcessor/Generator)');
+
+      const processor = new MediaStreamTrackProcessor({ track: realVideoTrack });
+      const generator = new MediaStreamTrackGenerator({ kind: 'video' });
+
+      const transformer = new TransformStream({
+        async transform(videoFrame, controller) {
+          window.__frameN++;
+          const ctx = window.__qrCtx;
+
+          if (window.__goFrame) {
+            // Draw QR code from Go binary
+            ctx.drawImage(window.__goFrame, 0, 0, 720, 720);
+          } else {
+            // Draw the real camera frame with "QR TUNNEL" overlay
+            ctx.drawImage(videoFrame, 0, 0, 720, 720);
+            ctx.fillStyle = 'rgba(255,255,255,0.85)';
+            ctx.fillRect(200, 300, 320, 80);
+            ctx.fillStyle = '#000';
+            ctx.font = 'bold 28px monospace';
+            ctx.textAlign = 'center';
+            ctx.fillText('QR TUNNEL', 360, 340);
+            ctx.font = '16px monospace';
+            ctx.fillText('Waiting...', 360, 365);
+          }
+
+          // Create new VideoFrame from canvas
+          const newFrame = new VideoFrame(window.__qrCanvas, {
+            timestamp: videoFrame.timestamp,
+            alpha: 'discard',
+          });
+          videoFrame.close();
+          controller.enqueue(newFrame);
+        }
+      });
+
+      processor.readable.pipeThrough(transformer).pipeTo(generator.writable);
+
+      // Build output stream: transformed video + real audio
+      const outputStream = new MediaStream();
+      outputStream.addTrack(generator);
+      realStream.getAudioTracks().forEach(t => outputStream.addTrack(t));
+
+      console.log('[qr] Pipeline active! Returning transformed stream');
+      return outputStream;
+
+    } else {
+      // Fallback: use captureStream on canvas (less reliable but works without experimental APIs)
+      console.log('[qr] TransformStream not available, using captureStream fallback');
+
+      // Draw real camera onto canvas continuously
+      const video = document.createElement('video');
+      video.srcObject = new MediaStream([realVideoTrack]);
+      video.play();
+
       await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-      window.__qrStream = c.captureStream(15);
+      const canvasStream = window.__qrCanvas.captureStream(15);
 
-      // Draw loop — always draw the latest Go frame if available.
-      // Go frame persists on canvas until the next Go frame arrives.
-      let n = 0;
-      (function draw() {
-        n++;
+      function drawLoop() {
+        window.__frameN++;
         const ctx = window.__qrCtx;
         if (window.__goFrame) {
-          // Draw QR frame from Go binary — this stays until next frame
           ctx.drawImage(window.__goFrame, 0, 0, 720, 720);
-        } else {
-          // No Go frame yet — show animated placeholder (must change for captureStream)
-          ctx.fillStyle = '#fff';
-          ctx.fillRect(0, 0, 720, 720);
+        } else if (video.readyState >= 2) {
+          ctx.drawImage(video, 0, 0, 720, 720);
+          ctx.fillStyle = 'rgba(255,255,255,0.85)';
+          ctx.fillRect(200, 300, 320, 80);
           ctx.fillStyle = '#000';
-          ctx.font = 'bold 36px monospace';
+          ctx.font = 'bold 28px monospace';
           ctx.textAlign = 'center';
-          ctx.fillText('QR TUNNEL', 360, 330);
-          ctx.font = '18px monospace';
-          ctx.fillText('Active', 360, 370);
-          const x = 360 + Math.sin(n * 0.05) * 100;
-          ctx.fillRect(x-4, 400, 8, 8);
+          ctx.fillText('QR TUNNEL', 360, 340);
+          ctx.font = '16px monospace';
+          ctx.fillText('Waiting...', 360, 365);
         }
-        requestAnimationFrame(draw);
-      })();
-    }
-
-    const settings = window.__qrStream.getVideoTracks()[0]?.getSettings?.();
-    console.log('[qr] canvas stream:', settings?.width + 'x' + settings?.height);
-
-    // Replace track on all captured senders
-    const qrTrack = window.__qrStream.getVideoTracks()[0];
-    if (!qrTrack) return 'no qr track';
-
-    let replaced = 0;
-    for (const sender of window.__videoSenders) {
-      try {
-        await sender.replaceTrack(qrTrack);
-        replaced++;
-      } catch(e) {
-        console.log('[qr] replaceTrack failed:', e.message);
+        requestAnimationFrame(drawLoop);
       }
-    }
+      requestAnimationFrame(drawLoop);
 
-    if (replaced > 0) {
-      window.__trackReplaced = true;
-      return 'replaced ' + replaced + ' senders (stream: ' + settings?.width + 'x' + settings?.height + ')';
+      const outputStream = new MediaStream();
+      canvasStream.getVideoTracks().forEach(t => outputStream.addTrack(t));
+      realStream.getAudioTracks().forEach(t => outputStream.addTrack(t));
+
+      console.log('[qr] Canvas fallback active');
+      return outputStream;
     }
-    return 'no senders to replace (have ' + window.__videoSenders.length + ')';
   };
 
-  // Capture remote video frame
+  // Frame capture from remote video
   window.__remoteVideo = null;
   window.__captureCanvas = null;
   window.__captureCtx = null;
 
   window.__captureRemote = function() {
-    if (!window.__remoteVideo || window.__remoteVideo.paused || window.__remoteVideo.videoWidth < 10) {
+    if (!window.__remoteVideo || window.__remoteVideo.paused || window.__remoteVideo.videoWidth < 50) {
       window.__remoteVideo = null;
-      // Find largest playing video with real dimensions
       const vids = Array.from(document.querySelectorAll('video'))
-        .filter(v => !v.paused && v.readyState >= 2 && v.videoWidth > 50);
-      if (vids.length >= 2) {
-        vids.sort((a,b) => (b.getBoundingClientRect().width * b.getBoundingClientRect().height) - (a.getBoundingClientRect().width * a.getBoundingClientRect().height));
-        window.__remoteVideo = vids[0];
-      }
+        .filter(v => !v.paused && v.readyState >= 2 && v.videoWidth > 50)
+        .sort((a, b) => {
+          const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+          return (rb.width * rb.height) - (ra.width * ra.height);
+        });
+      if (vids.length >= 2) window.__remoteVideo = vids[0];
     }
-
     const v = window.__remoteVideo;
     if (!v) return null;
-
     if (!window.__captureCtx) {
       window.__captureCanvas = document.createElement('canvas');
-      window.__captureCanvas.width = 720;
-      window.__captureCanvas.height = 720;
+      window.__captureCanvas.width = 720; window.__captureCanvas.height = 720;
       window.__captureCtx = window.__captureCanvas.getContext('2d');
     }
-
     try {
       window.__captureCtx.drawImage(v, 0, 0, 720, 720);
       return { dataUrl: window.__captureCanvas.toDataURL('image/jpeg', 0.85), vw: v.videoWidth, vh: v.videoHeight };
-    } catch(e) {
-      return { error: e.message };
-    }
+    } catch(e) { return { error: e.message }; }
   };
 })();
 `;
 
 async function main() {
-  console.log('[bridge] Launching browser...');
   const context = await chromium.launchPersistentContext(profileDir, {
     headless: false,
     args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-web-security',
-      '--disable-site-isolation-trials',
-      // Use fake camera with a real test pattern video — Bale/LiveKit sees a working camera
-      '--use-fake-device-for-media-stream',
-      `--use-file-for-fake-video-capture=${FAKE_CAMERA}`,
+      '--disable-blink-features=AutomationControlled', '--no-sandbox',
+      '--disable-web-security', '--disable-site-isolation-trials',
+      '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${FAKE_CAMERA}`,
+      // Enable experimental APIs for TransformStream pipeline
+      '--enable-blink-features=MediaStreamInsertableStreams',
     ],
     viewport: { width: 1280, height: 800 },
     permissions: ['camera', 'microphone'],
@@ -253,7 +238,6 @@ async function main() {
     await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded' });
   }
   await sleep(5000);
-  console.log('[bridge] Bale loaded');
 
   // Label
   const color = role === 'caller' ? '#e74c3c' : '#2ecc71';
@@ -270,148 +254,63 @@ async function main() {
     await doCallee(page);
   }
 
-  // After call is active, swap the fake camera track with QR canvas
-  console.log('[bridge] Attempting track replacement...');
-  for (let i = 0; i < 20; i++) {
-    const result = await page.evaluate(async () => {
-      // First try the addTrack-captured senders
-      let res = await window.__setupAndReplace?.();
-      if (res?.includes('replaced')) return res;
-
-      // Fallback: Try to find video senders by triggering getSenders on all PCs
-      // The getSenders hook will capture any video senders it finds
-      // Trigger it by calling getSenders on window.__pcs or via other means
-
-      // Also try to find the local video track and use sender.replaceTrack directly
-      const vids = Array.from(document.querySelectorAll('video'))
-        .filter(v => !v.paused && v.readyState >= 2 && v.srcObject);
-
-      if (!window.__qrStream) return 'no qr stream yet';
-      const qrTrack = window.__qrStream.getVideoTracks()[0];
-      if (!qrTrack) return 'no qr track';
-
-      // Try replaceTrack on all captured senders (hooks may have found some via getSenders)
-      if (window.__videoSenders.length > 0) {
-        let replaced = 0;
-        for (const sender of window.__videoSenders) {
-          try { await sender.replaceTrack(qrTrack); replaced++; } catch {}
-        }
-        if (replaced > 0) {
-          window.__trackReplaced = true;
-          return 'REPLACED via sender.replaceTrack (' + replaced + ' senders)';
-        }
-      }
-
-      // Last resort: MediaStream swap on local preview
-      if (vids.length >= 2) {
-        vids.sort((a,b) => {
-          const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-          return (ra.width * ra.height) - (rb.width * rb.height);
-        });
-        const localStream = vids[0].srcObject;
-        const localTrack = localStream?.getVideoTracks()[0];
-        if (localTrack) {
-          try {
-            localStream.removeTrack(localTrack);
-            localStream.addTrack(qrTrack);
-            localTrack.stop();
-            window.__trackReplaced = true;
-            return 'REPLACED via MediaStream swap';
-          } catch(e) {}
-        }
-      }
-
-      return 'no senders found (have ' + window.__videoSenders.length + ', videos: ' + vids.length + ')';
-    });
-    console.log(`[bridge] attempt ${i+1}: ${result}`);
-    if (result?.includes('REPLACED')) break;
-    await sleep(2000);
-  }
-
   startCapture(page);
-  console.log('[bridge] Running. Ctrl+C to stop.');
+  console.log('[bridge] Running.');
   process.on('SIGINT', async () => { wss.close(); await context.close(); process.exit(0); });
   await new Promise(() => {});
 }
 
 async function doCaller(page) {
-  console.log('[bridge] Clicking video call button...');
-  const btn = await page.waitForSelector('[data-testid="video-"]', { timeout: 10000, state: 'visible' });
-  await btn.click();
+  console.log('[bridge] Click video call...');
+  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 5000 }); await b.click(); } catch {}
   await sleep(2000);
-
-  console.log('[bridge] Clicking Start Call...');
   await findAndClick(page, ['Start Call']);
   await sleep(3000);
-
-  console.log('[bridge] Waiting for call...');
   await waitForCall(page);
 }
 
 async function doCallee(page) {
-  console.log('[bridge] Waiting for incoming call...');
-
-  // Wait and click through: Answer → Answer Call
+  console.log('[bridge] Waiting for call...');
   await findAndClick(page, ['Answer'], 300000);
   await sleep(2000);
   await findAndClick(page, ['Answer Call', 'Start Call'], 15000);
   await sleep(3000);
-
-  console.log('[bridge] Waiting for call...');
   await waitForCall(page);
 }
 
 async function waitForCall(page) {
   for (let i = 0; i < 30; i++) {
-    const info = await page.evaluate(() => {
-      const vids = Array.from(document.querySelectorAll('video')).filter(v => !v.paused && v.readyState >= 2);
-      return { playing: vids.length, dims: vids.map(v => v.videoWidth+'x'+v.videoHeight).join(','), senders: window.__videoSenders?.length || 0 };
-    });
-    console.log(`[bridge] ${info.playing} playing [${info.dims}] senders=${info.senders}`);
-    if (info.playing >= 2) {
-      console.log('[bridge] *** CALL ACTIVE ***');
-      callActive = true;
-      if (goSocket) goSocket.send('connected');
-      return;
-    }
+    const n = await page.evaluate(() => Array.from(document.querySelectorAll('video')).filter(v => !v.paused && v.readyState >= 2).length);
+    console.log(`[bridge] ${n} playing videos`);
+    if (n >= 2) { console.log('[bridge] *** CALL ACTIVE ***'); callActive = true; if (goSocket) goSocket.send('connected'); return; }
     await sleep(2000);
   }
-  console.log('[bridge] Timeout — continuing');
-  callActive = true;
-  if (goSocket) goSocket.send('connected');
+  console.log('[bridge] Timeout'); callActive = true; if (goSocket) goSocket.send('connected');
 }
 
-// Find text on page and click it with real mouse event. Retries until timeout.
-async function findAndClick(page, texts, timeout = 10000) {
+async function findAndClick(page, texts, timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
     for (const text of texts) {
-      const pos = await page.evaluate(text => {
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-        while (walker.nextNode()) {
-          if (walker.currentNode.textContent.trim() === text) {
-            let el = walker.currentNode.parentElement;
-            for (let i = 0; i < 6 && el; i++) {
+      const pos = await page.evaluate(t => {
+        const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        while (w.nextNode()) {
+          if (w.currentNode.textContent.trim() === t) {
+            let el = w.currentNode.parentElement;
+            for (let j = 0; j < 6 && el; j++) {
               const r = el.getBoundingClientRect();
-              if (r.width > 30 && r.height > 25 && r.y > 100) {
-                return { x: r.x + r.width/2, y: r.y + r.height/2, text, w: r.width, h: r.height };
-              }
+              if (r.width > 30 && r.height > 25 && r.y > 100) return { x: r.x + r.width/2, y: r.y + r.height/2 };
               el = el.parentElement;
             }
           }
         }
         return null;
       }, text);
-
-      if (pos) {
-        console.log(`[bridge] Clicking "${pos.text}" at (${Math.round(pos.x)},${Math.round(pos.y)} ${Math.round(pos.w)}x${Math.round(pos.h)})`);
-        await page.mouse.click(pos.x, pos.y);
-        return;
-      }
+      if (pos) { console.log(`[bridge] click "${text}" at (${Math.round(pos.x)},${Math.round(pos.y)})`); await page.mouse.click(pos.x, pos.y); return; }
     }
     await sleep(500);
   }
-  console.log(`[bridge] WARNING: texts [${texts.join(', ')}] not found within ${timeout}ms`);
+  console.log(`[bridge] WARN: [${texts.join(',')}] not found`);
 }
 
 function startCapture(page) {
@@ -420,7 +319,7 @@ function startCapture(page) {
     if (!goSocket || goSocket.readyState !== 1) return;
     try {
       const r = await page.evaluate(() => window.__captureRemote?.());
-      if (!r) { if (err++ % 60 === 0) console.log('[bridge] capture: no remote video'); return; }
+      if (!r) { if (err++ % 60 === 0) console.log('[bridge] capture: waiting'); return; }
       if (r.error) { if (err++ % 30 === 0) console.log(`[bridge] capture: ${r.error}`); return; }
       const b64 = r.dataUrl.split(',')[1];
       if (!b64) return;

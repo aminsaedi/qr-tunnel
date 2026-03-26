@@ -133,19 +133,24 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	return t
 }
 
-// OpenStream creates a new outgoing stream.
-func (t *Transport) OpenStream(id uint16) *Stream {
+// OpenStream creates a new outgoing stream with an optional SYN payload.
+func (t *Transport) OpenStream(id uint16, synPayload ...[]byte) *Stream {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	s := newStream(id, t)
 	t.streams[id] = s
 
-	// Send SYN
+	// Send SYN (with payload if provided — carries destination address)
+	var payload []byte
+	if len(synPayload) > 0 {
+		payload = synPayload[0]
+	}
 	t.sendQueue <- &transportFrame{
 		Flags:      FlagSYN,
 		StreamID:   id,
 		WindowSize: uint16(t.config.WindowSize),
+		Payload:    payload,
 	}
 
 	return s
