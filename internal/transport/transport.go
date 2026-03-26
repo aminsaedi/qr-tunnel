@@ -282,13 +282,16 @@ func (t *Transport) sendPendingFrames() {
 	maxPayload := t.config.QRConfig.ChunkSize
 	var packed []byte
 
-	// Drain send queue
+	// Prioritize NEW data from sendQueue over retransmits.
+	// Drain the send queue first.
+	hasNew := false
 	for {
 		select {
 		case frame := <-t.sendQueue:
+			hasNew = true
 			encoded := encodeTransportFrame(frame)
 			if len(packed)+len(encoded) > maxPayload {
-				// Send what we have, re-queue this frame
+				// Send what we have, start new batch with this frame
 				if len(packed) > 0 {
 					t.sendData(packed)
 				}
@@ -297,34 +300,41 @@ func (t *Transport) sendPendingFrames() {
 				packed = append(packed, encoded...)
 			}
 		default:
-			// Also check for retransmits and ACKs from streams
-			t.mu.RLock()
-			for _, s := range t.streams {
-				frames := s.getPendingFrames()
-				for _, f := range frames {
-					encoded := encodeTransportFrame(f)
-					if len(packed)+len(encoded) > maxPayload {
-						if len(packed) > 0 {
-							t.sendData(packed)
-						}
-						packed = encoded
-					} else {
-						packed = append(packed, encoded...)
+			goto doneQueue
+		}
+	}
+doneQueue:
+
+	// Only check retransmits and ACKs if there was nothing new to send.
+	if !hasNew {
+		t.mu.RLock()
+		for _, s := range t.streams {
+			frames := s.getPendingFrames()
+			for _, f := range frames {
+				encoded := encodeTransportFrame(f)
+				if len(packed)+len(encoded) > maxPayload {
+					if len(packed) > 0 {
+						t.sendData(packed)
 					}
+					packed = encoded
+				} else {
+					packed = append(packed, encoded...)
 				}
 			}
-			t.mu.RUnlock()
-
-			if len(packed) > 0 {
-				t.sendData(packed)
-			}
-			return
 		}
+		t.mu.RUnlock()
+	}
+
+	if len(packed) > 0 {
+		t.sendData(packed)
 	}
 }
 
 func (t *Transport) sendData(data []byte) {
-	// Encode the packed transport frames into QR and send via provider
+	// Encode the packed transport frames into QR and send via provider.
+	// We send exactly 1 QR frame per call. The draw loop continuously
+	// redraws the current frame (__goFrame), so the receiver captures it
+	// multiple times from the video feed — no need to burst duplicates.
 	ctx, cancel := context.WithTimeout(t.ctx, time.Second)
 	defer cancel()
 
@@ -333,25 +343,24 @@ func (t *Transport) sendData(data []byte) {
 		return
 	}
 
-	// Send a burst of frames (LT coded redundancy)
-	count := 0
-	for frame := range frames {
+	// Take the first encoded frame and send it once.
+	select {
+	case frame, ok := <-frames:
+		if !ok {
+			return
+		}
 		if err := t.provider.SendFrame(&provider.Frame{
 			Image:  frame,
 			Width:  t.config.QRConfig.FrameWidth,
 			Height: t.config.QRConfig.FrameHeight,
-		}); err != nil {
-			continue
+		}); err == nil {
+			t.BytesSent.Add(int64(len(data)))
 		}
-		count++
-		t.BytesSent.Add(int64(len(data)))
-
-		// Send enough frames for the LT codes to work with some redundancy
-		numBlocks := (len(data) / t.config.QRConfig.ChunkSize) + 1
-		if count >= numBlocks*2 {
-			break
-		}
+	case <-ctx.Done():
+		return
 	}
+	// Cancel the encoder goroutine — we only needed one frame.
+	cancel()
 }
 
 // Metrics returns current transport metrics.

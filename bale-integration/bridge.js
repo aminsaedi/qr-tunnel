@@ -11,7 +11,7 @@ const targetUser = args.find((_, i, a) => a[i - 1] === '--target') || '884923192
 const wsPort = parseInt(args.find((_, i, a) => a[i - 1] === '--ws-port') || '9000');
 const profileDir = args.find((_, i, a) => a[i - 1] === '--profile') ||
   path.join(__dirname, role === 'caller' ? 'profile-a' : 'profile-b');
-const FPS = 10;
+const FPS = 15; // Increased from 10 for better throughput
 const FAKE_CAMERA = '/tmp/qr-fake-camera.y4m';
 
 console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort}`);
@@ -37,22 +37,27 @@ function sendToGo(jpegBuf, seq) {
 }
 
 let txCount = 0;
+let pendingFrame = null; // Buffer latest frame, don't block on evaluate
+
 async function drawQRFrame(data) {
   if (!page) return;
-  try {
-    const b64 = data.slice(8).toString('base64');
-    await page.evaluate(async (b64) => {
-      return new Promise(resolve => {
-        const img = new Image();
-        img.onload = () => { window.__goFrame = img; resolve(true); };
-        img.onerror = () => resolve(false);
-        img.src = 'data:image/jpeg;base64,' + b64;
-        setTimeout(() => resolve(false), 2000);
-      });
-    }, b64);
-    if (++txCount % 5 === 1) console.log(`[bridge] tx→canvas #${txCount}`);
-  } catch {}
+  pendingFrame = data.slice(8).toString('base64');
+  txCount++;
 }
+
+// Non-blocking frame pump: sends latest QR frame to browser at steady rate
+setInterval(async () => {
+  if (!page || !pendingFrame) return;
+  const b64 = pendingFrame;
+  pendingFrame = null; // Clear — we'll get fresh ones from Go
+  try {
+    await page.evaluate(b64 => {
+      const img = new Image();
+      img.onload = () => { window.__goFrame = img; };
+      img.src = 'data:image/jpeg;base64,' + b64;
+    }, b64);
+  } catch {}
+}, 50); // 20fps pump rate
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
@@ -207,7 +212,7 @@ const INIT_SCRIPT = `
     }
     try {
       window.__captureCtx.drawImage(v, 0, 0, 720, 720);
-      return { dataUrl: window.__captureCanvas.toDataURL('image/jpeg', 0.85), vw: v.videoWidth, vh: v.videoHeight };
+      return { dataUrl: window.__captureCanvas.toDataURL('image/jpeg', 0.70), vw: v.videoWidth, vh: v.videoHeight };
     } catch(e) { return { error: e.message }; }
   };
 })();

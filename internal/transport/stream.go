@@ -83,7 +83,7 @@ func (s *Stream) Write(data []byte) (int, error) {
 	}
 
 	// Fragment into chunks
-	maxChunk := 500 // leave room for headers in QR payload
+	maxChunk := 350 // Must fit in one QR frame with transport header (15 bytes)
 	written := 0
 
 	for written < len(data) {
@@ -213,6 +213,13 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 		s.needsAck = false
 	}
 	s.recvMu.Unlock()
+
+	// Only retransmit DATA segments once the stream is open.
+	// The SYN was sent via sendQueue directly and is never in sendBuf,
+	// so there is nothing useful to retransmit until we reach streamStateOpen.
+	if s.state != streamStateOpen {
+		return frames
+	}
 
 	// Check for retransmits
 	s.sendMu.Lock()
