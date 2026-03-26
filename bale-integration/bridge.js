@@ -37,27 +37,25 @@ function sendToGo(jpegBuf, seq) {
 }
 
 let txCount = 0;
-let pendingFrame = null; // Buffer latest frame, don't block on evaluate
 
 async function drawQRFrame(data) {
   if (!page) return;
-  pendingFrame = data.slice(8).toString('base64');
-  txCount++;
-}
-
-// Non-blocking frame pump: sends latest QR frame to browser at steady rate
-setInterval(async () => {
-  if (!page || !pendingFrame) return;
-  const b64 = pendingFrame;
-  pendingFrame = null; // Clear — we'll get fresh ones from Go
   try {
-    await page.evaluate(b64 => {
-      const img = new Image();
-      img.onload = () => { window.__goFrame = img; };
-      img.src = 'data:image/jpeg;base64,' + b64;
+    const b64 = data.slice(8).toString('base64');
+    // Draw directly — synchronous with Go's send rate
+    // This ensures the canvas is updated immediately when Go sends a new frame
+    await page.evaluate(async (b64) => {
+      return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => { window.__goFrame = img; resolve(true); };
+        img.onerror = () => resolve(false);
+        img.src = 'data:image/jpeg;base64,' + b64;
+        setTimeout(() => resolve(false), 2000);
+      });
     }, b64);
+    txCount++;
   } catch {}
-}, 33); // 30fps pump rate — bitmap only needs 1 clean capture
+}
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 

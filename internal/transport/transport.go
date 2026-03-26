@@ -253,8 +253,9 @@ func (t *Transport) handleIncomingData(data []byte) {
 		}
 		offset += transportHeaderSize + len(frame.Payload)
 		if frame.Flags != 0 {
-			log.Printf("[transport] rx: flags=0x%02x stream=%d seq=%d ack=%d payload=%d",
-				frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload))
+			payloadHash := crc32.ChecksumIEEE(frame.Payload)
+			log.Printf("[transport] rx: flags=0x%02x stream=%d seq=%d ack=%d payload=%d payloadHash=%08x",
+				frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload), payloadHash)
 		}
 		t.handleFrame(frame)
 	}
@@ -346,7 +347,7 @@ func (t *Transport) sendLoop() {
 		}
 
 		t.sendPendingFrames()
-		time.Sleep(300 * time.Millisecond)
+		time.Sleep(400 * time.Millisecond)
 	}
 }
 

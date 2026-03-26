@@ -129,11 +129,14 @@ func (d *Decoder) sampleBlock(frame *image.RGBA, bx, by, bs int) uint8 {
 	px := bx * bs
 	py := by * bs
 
-	// Sample center region (half the block size, centered)
-	margin := bs / 4
+	// Sample center 3/4 of the block for maximum noise averaging
+	margin := bs / 8
+	if margin < 1 {
+		margin = 1
+	}
 	startX := px + margin
 	startY := py + margin
-	sampleSize := bs / 2
+	sampleSize := bs - 2*margin
 	if sampleSize < 4 {
 		sampleSize = 4
 	}

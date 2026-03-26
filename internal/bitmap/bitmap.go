@@ -24,8 +24,9 @@ var Levels2 = [4]uint8{20, 100, 180, 250}
 var Thresholds2 = [3]uint8{60, 140, 215}
 
 // Luminance levels for 1-bit encoding (2 levels).
-var Levels1 = [2]uint8{40, 220}
-var Thresholds1 = [1]uint8{130}
+// Maximum separation for best codec resilience.
+var Levels1 = [2]uint8{10, 245}
+var Thresholds1 = [1]uint8{128}
 
 // Config controls the bitmap encoder/decoder parameters.
 type Config struct {
