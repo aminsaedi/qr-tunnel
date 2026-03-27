@@ -143,7 +143,7 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 		decoder:     bitmap.NewDecoder(config.BitmapConfig),
 		config:      config,
 		streams:     make(map[uint16]*Stream),
-		sendQueue:   make(chan *transportFrame, 1024),
+		sendQueue:   make(chan *transportFrame, 32),
 		acceptQueue: make(chan *Stream, 16),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -235,6 +235,7 @@ func (t *Transport) OpenStream(id uint16, synPayload ...[]byte) *Stream {
 	if len(synPayload) > 0 {
 		payload = synPayload[0]
 	}
+	s.synSentData = payload // store for retransmit
 	t.sendQueue <- &transportFrame{
 		Flags:      FlagSYN,
 		StreamID:   id,
@@ -269,8 +270,9 @@ func (t *Transport) streamReaper() {
 			idle := now.Sub(lastRecv)
 			age := now.Sub(s.createdAt)
 
-			// Close streams idle > 30s or older than 2 minutes
-			if idle > 30*time.Second || age > 2*time.Minute {
+			// Close streams idle > 90s or older than 5 minutes
+			// Telegram keeps connections open between messages — don't be too aggressive
+			if idle > 90*time.Second || age > 5*time.Minute {
 				toClose = append(toClose, id)
 			}
 		}
@@ -346,11 +348,14 @@ func (t *Transport) handleFrame(f *transportFrame) {
 		t.streams[f.StreamID] = stream
 		t.mu.Unlock()
 
-		// Send SYN+ACK
-		t.sendQueue <- &transportFrame{
+		// Send SYN+ACK (retransmitted by getPendingFrames if lost)
+		select {
+		case t.sendQueue <- &transportFrame{
 			Flags:      FlagSYN | FlagACK,
 			StreamID:   f.StreamID,
 			WindowSize: uint16(t.config.WindowSize),
+		}:
+		default:
 		}
 
 		// Store the SYN payload as connection metadata (not in recvBuf)
@@ -446,8 +451,26 @@ func (t *Transport) sendPendingFrames() bool {
 	var packed []byte
 	queueLen := len(t.sendQueue)
 
-	// PRIORITY 1: ACKs and retransmits — these unblock the receiver.
-	// Without retransmits, the receiver stalls on missing sequences forever.
+	// PRIORITY 1: New data from queue (fresh SYNs, DATA, FINs)
+	for {
+		select {
+		case frame := <-t.sendQueue:
+			encoded := encodeTransportFrame(frame)
+			if len(packed)+len(encoded) > maxPayload {
+				select {
+				case t.sendQueue <- frame:
+				default:
+				}
+				goto fillRetransmits
+			}
+			packed = append(packed, encoded...)
+		default:
+			goto fillRetransmits
+		}
+	}
+fillRetransmits:
+
+	// PRIORITY 2: Fill remaining space with ACKs and retransmits
 	t.mu.RLock()
 	for _, s := range t.streams {
 		for _, f := range s.getPendingFrames() {
@@ -460,26 +483,6 @@ func (t *Transport) sendPendingFrames() bool {
 	}
 	t.mu.RUnlock()
 
-	// PRIORITY 2: Fill remaining space with new data from queue
-	for {
-		select {
-		case frame := <-t.sendQueue:
-			encoded := encodeTransportFrame(frame)
-			if len(packed)+len(encoded) > maxPayload {
-				// Re-queue the frame that didn't fit
-				select {
-				case t.sendQueue <- frame:
-				default:
-				}
-				goto sendIt
-			}
-			packed = append(packed, encoded...)
-		default:
-			goto sendIt
-		}
-	}
-
-sendIt:
 	if len(packed) > 0 {
 		if queueLen > 0 {
 			log.Printf("[transport] sendPending: queue=%d packed=%d bytes", queueLen, len(packed))

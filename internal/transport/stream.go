@@ -43,7 +43,8 @@ type Stream struct {
 	ackPending int               // count of unacked DATA frames (for batching)
 
 	// SYN payload (connection metadata)
-	synPayload []byte
+	synPayload  []byte
+	synSentData []byte // original SYN payload for retransmit
 
 	// Lifecycle
 	opened    chan struct{} // closed when SYN+ACK received
@@ -87,11 +88,6 @@ func (s *Stream) WaitOpen(timeout time.Duration) error {
 	}
 }
 
-// maxInFlight limits unACKed frames per stream. This prevents any single stream
-// from flooding the send queue, keeping round-trip latency low for all streams.
-// At ~1 frame/sec through Bale VP9, 4 in-flight = ~4 seconds of data.
-const maxInFlight = 4
-
 // Write sends data over the stream.
 func (s *Stream) Write(data []byte) (int, error) {
 	if s.closed.Load() {
@@ -109,21 +105,6 @@ func (s *Stream) Write(data []byte) (int, error) {
 	for written < len(data) {
 		if s.closed.Load() {
 			return written, io.ErrClosedPipe
-		}
-
-		// Flow control: wait if too many frames in flight (unACKed)
-		for i := 0; i < 100; i++ {
-			s.sendMu.Lock()
-			inFlight := len(s.sendBuf)
-			s.sendMu.Unlock()
-			if inFlight < maxInFlight {
-				break
-			}
-			// Wait for ACKs to drain the send buffer
-			time.Sleep(150 * time.Millisecond)
-			if s.closed.Load() {
-				return written, io.ErrClosedPipe
-			}
 		}
 
 		end := written + maxChunk
@@ -145,13 +126,17 @@ func (s *Stream) Write(data []byte) (int, error) {
 		})
 		s.sendMu.Unlock()
 
-		// Queue for sending
-		s.transport.sendQueue <- &transportFrame{
+		// Queue for sending (non-blocking — if full, retransmit will pick it up)
+		select {
+		case s.transport.sendQueue <- &transportFrame{
 			Flags:      FlagDATA,
 			StreamID:   s.ID,
 			SeqNum:     seq,
 			WindowSize: uint16(s.transport.config.WindowSize),
 			Payload:    chunk,
+		}:
+		default:
+			// Queue full — frame stays in sendBuf, retransmit handles it
 		}
 
 		s.transport.BytesSent.Add(int64(len(chunk)))
@@ -299,14 +284,36 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 	}
 	s.recvMu.Unlock()
 
-	// Only retransmit DATA segments once the stream is open.
-	// The SYN was sent via sendQueue directly and is never in sendBuf,
-	// so there is nothing useful to retransmit until we reach streamStateOpen.
+	// Retransmit SYN if stream hasn't opened yet (VP9 may have dropped it)
+	if s.state == streamStateSynSent {
+		age := time.Since(s.createdAt)
+		if age > 2*time.Second && int(age.Seconds())%2 == 0 {
+			frames = append(frames, &transportFrame{
+				Flags:      FlagSYN,
+				StreamID:   s.ID,
+				WindowSize: uint16(s.transport.config.WindowSize),
+				Payload:    s.synSentData,
+			})
+		}
+		return frames
+	}
+
+	// Retransmit SYN+ACK for server-accepted streams that haven't received data yet
+	if s.state == streamStateOpen && s.recvNext == 1 && time.Since(s.createdAt) > 2*time.Second {
+		if int(time.Since(s.createdAt).Seconds())%2 == 0 {
+			frames = append(frames, &transportFrame{
+				Flags:      FlagSYN | FlagACK,
+				StreamID:   s.ID,
+				WindowSize: uint16(s.transport.config.WindowSize),
+			})
+		}
+	}
+
 	if s.state != streamStateOpen {
 		return frames
 	}
 
-	// Check for retransmits
+	// Check for retransmits (max 5 attempts per frame, then give up)
 	s.sendMu.Lock()
 	rtt := time.Duration(s.transport.RTTEstimate.Load())
 	timeout := rtt * 2
@@ -315,10 +322,15 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 	}
 
 	now := time.Now()
+	var keepBuf []pendingSegment
 	for i := range s.sendBuf {
+		if s.sendBuf[i].retries >= 5 {
+			continue // give up — stop wasting bandwidth
+		}
+		keepBuf = append(keepBuf, s.sendBuf[i])
 		if now.Sub(s.sendBuf[i].sentAt) > timeout {
-			s.sendBuf[i].sentAt = now
-			s.sendBuf[i].retries++
+			keepBuf[len(keepBuf)-1].sentAt = now
+			keepBuf[len(keepBuf)-1].retries++
 			frames = append(frames, &transportFrame{
 				Flags:      FlagDATA,
 				StreamID:   s.ID,
@@ -328,6 +340,7 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 			})
 		}
 	}
+	s.sendBuf = keepBuf
 	s.sendMu.Unlock()
 
 	return frames
