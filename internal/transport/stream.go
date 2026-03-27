@@ -46,9 +46,11 @@ type Stream struct {
 	synPayload []byte
 
 	// Lifecycle
-	opened chan struct{} // closed when SYN+ACK received
-	closed atomic.Bool
-	doneCh chan struct{} // closed when stream is fully done
+	opened    chan struct{} // closed when SYN+ACK received
+	closed    atomic.Bool
+	doneCh    chan struct{} // closed when stream is fully done
+	createdAt time.Time
+	lastRecv  atomic.Int64 // unix nanos of last received data
 }
 
 type pendingSegment struct {
@@ -59,7 +61,7 @@ type pendingSegment struct {
 }
 
 func newStream(id uint16, t *Transport) *Stream {
-	return &Stream{
+	s := &Stream{
 		ID:         id,
 		transport:  t,
 		state:      streamStateSynSent,
@@ -69,7 +71,10 @@ func newStream(id uint16, t *Transport) *Stream {
 		recvQueue:  make(map[uint32][]byte),
 		opened:     make(chan struct{}),
 		doneCh:     make(chan struct{}),
+		createdAt:  time.Now(),
 	}
+	s.lastRecv.Store(time.Now().UnixNano())
+	return s
 }
 
 // WaitOpen waits for the stream to be opened (SYN+ACK received).
@@ -202,6 +207,7 @@ func (s *Stream) handleData(seqNum uint32, data []byte) {
 	dataHash := crc32.ChecksumIEEE(data)
 	log.Printf("[stream] handleData: stream=%d seq=%d data=%d bytes hash=%08x recvNext=%d", s.ID, seqNum, len(data), dataHash, s.recvNext)
 
+	s.lastRecv.Store(time.Now().UnixNano())
 	s.ackPending++
 	// Batch ACKs: send after every 4 DATA frames to reduce ACK overhead.
 	// Each ACK is 19 bytes in a ~960 byte frame — wasteful if sent alone.

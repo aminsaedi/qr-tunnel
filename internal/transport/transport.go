@@ -196,6 +196,11 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	// Start send loop
 	go t.sendLoop()
 
+	// Start stream reaper — closes zombie streams that accumulate when
+	// FIN packets get lost through VP9. Without this, hundreds of idle
+	// streams generate retransmit traffic that starves active streams.
+	go t.streamReaper()
+
 	return t
 }
 
@@ -238,6 +243,52 @@ func (t *Transport) OpenStream(id uint16, synPayload ...[]byte) *Stream {
 	}
 
 	return s
+}
+
+// streamReaper periodically closes idle/zombie streams.
+func (t *Transport) streamReaper() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		now := time.Now()
+		var toClose []uint16
+
+		t.mu.RLock()
+		for id, s := range t.streams {
+			if s.closed.Load() {
+				toClose = append(toClose, id)
+				continue
+			}
+			lastRecv := time.Unix(0, s.lastRecv.Load())
+			idle := now.Sub(lastRecv)
+			age := now.Sub(s.createdAt)
+
+			// Close streams idle > 30s or older than 2 minutes
+			if idle > 30*time.Second || age > 2*time.Minute {
+				toClose = append(toClose, id)
+			}
+		}
+		t.mu.RUnlock()
+
+		if len(toClose) > 0 {
+			t.mu.Lock()
+			for _, id := range toClose {
+				if s, ok := t.streams[id]; ok {
+					s.close()
+					delete(t.streams, id)
+				}
+			}
+			active := len(t.streams)
+			t.mu.Unlock()
+			log.Printf("[transport] reaper: closed %d streams, %d active", len(toClose), active)
+		}
+	}
 }
 
 // AcceptStream returns a channel of new incoming streams.
