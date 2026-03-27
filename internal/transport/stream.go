@@ -284,10 +284,10 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 	}
 	s.recvMu.Unlock()
 
-	// Retransmit SYN if stream hasn't opened yet (VP9 may have dropped it)
+	// Retransmit SYN once after 3 seconds if stream hasn't opened
 	if s.state == streamStateSynSent {
 		age := time.Since(s.createdAt)
-		if age > 2*time.Second && int(age.Seconds())%2 == 0 {
+		if age > 3*time.Second && age < 4*time.Second {
 			frames = append(frames, &transportFrame{
 				Flags:      FlagSYN,
 				StreamID:   s.ID,
@@ -296,17 +296,6 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 			})
 		}
 		return frames
-	}
-
-	// Retransmit SYN+ACK for server-accepted streams that haven't received data yet
-	if s.state == streamStateOpen && s.recvNext == 1 && time.Since(s.createdAt) > 2*time.Second {
-		if int(time.Since(s.createdAt).Seconds())%2 == 0 {
-			frames = append(frames, &transportFrame{
-				Flags:      FlagSYN | FlagACK,
-				StreamID:   s.ID,
-				WindowSize: uint16(s.transport.config.WindowSize),
-			})
-		}
 	}
 
 	if s.state != streamStateOpen {
