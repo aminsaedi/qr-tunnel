@@ -236,11 +236,11 @@ async function main() {
 
   console.log('[bridge] Opening Bale...');
   if (role === 'caller') {
-    await page.goto(`https://web.bale.ai/chat?uid=${targetUser}`, { waitUntil: 'networkidle' });
+    await page.goto(`https://web.bale.ai/chat?uid=${targetUser}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
   } else {
-    await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded' });
+    await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded', timeout: 120000 });
   }
-  await sleep(5000);
+  await sleep(10000);
 
   // Label
   const color = role === 'caller' ? '#e74c3c' : '#2ecc71';
