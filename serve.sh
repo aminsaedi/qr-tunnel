@@ -36,42 +36,50 @@ if [ ! -d bale-integration/node_modules ]; then
   cd bale-integration && npm install && cd ..
 fi
 
-echo ""
-echo "Starting browser bridge (callee — auto-answers calls)..."
-cd bale-integration
-node bridge.js --role callee --ws-port 9001 --profile "$PROFILE" &
-BRIDGE_PID=$!
-cd ..
-sleep 3
+STOPPED=false
+trap 'STOPPED=true; echo ""; echo "Stopping..."; kill $GO_PID 2>/dev/null; kill $BRIDGE_PID 2>/dev/null; wait 2>/dev/null; echo "Bye."; exit 0' INT TERM
 
-echo "Starting tunnel server (exit node)..."
-./qr-tunnel bale-server --bridge ws://localhost:9001 &
-GO_PID=$!
-sleep 2
-
-cleanup() {
+# Loop: each iteration handles one call session
+while ! $STOPPED; do
   echo ""
-  echo "Shutting down..."
+  echo "Starting browser bridge (callee — auto-answers calls)..."
+  cd bale-integration
+  node bridge.js --role callee --ws-port 9001 --profile "$PROFILE" &
+  BRIDGE_PID=$!
+  cd ..
+  sleep 3
+
+  echo "Starting tunnel server (exit node)..."
+  ./qr-tunnel bale-server --bridge ws://localhost:9001 &
+  GO_PID=$!
+  sleep 2
+
+  echo ""
+  echo "==========================================="
+  echo "  SERVER READY"
+  echo ""
+  echo "  Waiting for incoming Bale video call."
+  echo "  The call will be auto-answered."
+  echo ""
+  echo "  Once connected, the caller gets:"
+  echo "    SOCKS5 proxy at 127.0.0.1:1080"
+  echo "    HTTP proxy at 127.0.0.1:8080"
+  echo ""
+  echo "  Press Ctrl+C to stop."
+  echo "==========================================="
+  echo ""
+
+  # Wait for bridge to exit (call ended or error)
+  wait $BRIDGE_PID 2>/dev/null || true
+
+  # Clean up this session
   kill $GO_PID 2>/dev/null || true
-  kill $BRIDGE_PID 2>/dev/null || true
-  wait 2>/dev/null
-  echo "Done."
-}
-trap cleanup EXIT INT TERM
+  wait $GO_PID 2>/dev/null || true
 
-echo ""
-echo "==========================================="
-echo "  SERVER READY"
-echo ""
-echo "  Waiting for incoming Bale video call."
-echo "  The call will be auto-answered."
-echo ""
-echo "  Once connected, the caller gets:"
-echo "    SOCKS5 proxy at 127.0.0.1:1080"
-echo "    HTTP proxy at 127.0.0.1:8080"
-echo ""
-echo "  Press Ctrl+C to stop."
-echo "==========================================="
-echo ""
-
-wait
+  if ! $STOPPED; then
+    echo ""
+    echo "[serve] Call ended. Restarting in 5 seconds..."
+    echo "        (Ctrl+C to stop)"
+    sleep 5
+  fi
+done

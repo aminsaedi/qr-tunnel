@@ -317,13 +317,23 @@ async function findAndClick(page, texts, timeout = 15000) {
 }
 
 function startCapture(page) {
-  let seq = 0, ok = 0, err = 0;
+  let seq = 0, ok = 0, err = 0, consecutiveEmpty = 0;
   setInterval(async () => {
     if (!goSocket || goSocket.readyState !== 1) return;
     try {
       const r = await page.evaluate(() => window.__captureRemote?.());
-      if (!r) { if (err++ % 60 === 0) console.log('[bridge] capture: waiting'); return; }
+      if (!r) {
+        consecutiveEmpty++;
+        if (consecutiveEmpty % 60 === 0) console.log('[bridge] capture: waiting');
+        // Detect call ended: if we had frames before but none for 30+ seconds
+        if (ok > 10 && consecutiveEmpty > FPS * 30) {
+          console.log('[bridge] Call ended (no video for 30s). Exiting.');
+          process.exit(0);
+        }
+        return;
+      }
       if (r.error) { if (err++ % 30 === 0) console.log(`[bridge] capture: ${r.error}`); return; }
+      consecutiveEmpty = 0;
       const b64 = r.dataUrl.split(',')[1];
       if (!b64) return;
       sendToGo(Buffer.from(b64, 'base64'), ++seq);
