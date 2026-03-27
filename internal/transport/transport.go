@@ -320,14 +320,20 @@ func (t *Transport) handleFrame(f *transportFrame) {
 		t.BytesReceived.Add(int64(len(f.Payload)))
 	}
 
-	// Handle FIN
+	// Handle FIN — close and remove stream
 	if f.Flags&FlagFIN != 0 {
 		stream.handleFin()
+		t.mu.Lock()
+		delete(t.streams, f.StreamID)
+		t.mu.Unlock()
 	}
 
-	// Handle RST
+	// Handle RST — close and remove stream
 	if f.Flags&FlagRST != 0 {
 		stream.close()
+		t.mu.Lock()
+		delete(t.streams, f.StreamID)
+		t.mu.Unlock()
 	}
 }
 
@@ -347,7 +353,7 @@ func (t *Transport) sendLoop() {
 		}
 
 		t.sendPendingFrames()
-		time.Sleep(400 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
