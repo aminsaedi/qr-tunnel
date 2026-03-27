@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -40,11 +41,15 @@ const (
 	repAddrNotSupported = 0x08
 )
 
+// MaxConcurrentStreams limits parallel tunnel streams.
+const MaxConcurrentStreams = 2
+
 // Server implements a SOCKS5 proxy that routes through the QR transport.
 type Server struct {
 	transport *transport.Transport
 	listener  net.Listener
 	nextID    atomic.Uint32
+	streamSem chan struct{}
 
 	// Metrics
 	ActiveConns atomic.Int32
@@ -55,6 +60,7 @@ type Server struct {
 func NewServer(t *transport.Transport) *Server {
 	return &Server{
 		transport: t,
+		streamSem: make(chan struct{}, MaxConcurrentStreams),
 	}
 }
 
@@ -159,7 +165,9 @@ func (s *Server) handleConn(conn net.Conn) {
 		if _, err := io.ReadFull(conn, addr); err != nil {
 			return
 		}
-		dstAddr = net.IP(addr).String()
+		// Reject IPv6 — server likely has no IPv6, and these waste tunnel bandwidth
+		sendReply(conn, repHostUnreachable, nil, 0)
+		return
 	default:
 		sendReply(conn, repAddrNotSupported, nil, 0)
 		return
@@ -177,18 +185,28 @@ func (s *Server) handleConn(conn net.Conn) {
 	// Clear deadline for data relay
 	_ = conn.SetDeadline(time.Time{})
 
+	// Limit concurrent stream SETUP (SYN→SYN+ACK) to avoid flooding the tunnel.
+	// Release after setup so established streams share bandwidth freely.
+	select {
+	case s.streamSem <- struct{}{}:
+	case <-time.After(10 * time.Second):
+		sendReply(conn, repGeneralFailure, nil, 0)
+		return
+	}
+
 	// Open a transport stream with destination as SYN payload
-	// Use sequential IDs starting from 1 (avoid 0 which is used for control)
 	streamID := s.transport.NextStreamID()
 	stream := s.transport.OpenStream(streamID, []byte(dst))
 
-	// Wait for stream to open — longer timeout for QR video pipeline
-	if err := stream.WaitOpen(90 * time.Second); err != nil {
+	// Wait for stream to open
+	if err := stream.WaitOpen(15 * time.Second); err != nil {
+		<-s.streamSem // release setup slot
 		log.Printf("[socks5] stream open failed: %v", err)
 		sendReply(conn, repHostUnreachable, nil, 0)
 		stream.Close()
 		return
 	}
+	<-s.streamSem // release setup slot — stream is now established
 
 	// Success
 	sendReply(conn, repSuccess, net.IPv4zero, 0)
@@ -233,6 +251,13 @@ func (s *Server) handleServerStream(stream *transport.Stream) {
 	}
 
 	dst := string(synPayload)
+
+	// Fast-reject IPv6 destinations (server likely has no IPv6 route)
+	if host, _, err := net.SplitHostPort(dst); err == nil && strings.Contains(host, ":") {
+		log.Printf("[socks5-server] stream %d: rejecting IPv6 %s", stream.ID, dst)
+		return
+	}
+
 	log.Printf("[socks5-server] stream %d: waiting for first data before dialing %s", stream.ID, dst)
 
 	// Read initial data. For TLS, buffer the complete record before forwarding.

@@ -39,6 +39,21 @@ func TestBitmapSurvivesVP9(t *testing.T) {
 		{"16x16_1bit_100B_500k", 16, 1, 100, "500k"},
 		{"16x16_1bit_200B_500k", 16, 1, 200, "500k"},
 		{"16x16_1bit_100B_200k", 16, 1, 100, "200k"},
+
+		// 12x12 blocks, 1 bit — 410 bytes/frame (1.8x improvement)
+		{"12x12_1bit_200B_500k", 12, 1, 200, "500k"},
+		{"12x12_1bit_400B_500k", 12, 1, 400, "500k"},
+		{"12x12_1bit_200B_200k", 12, 1, 200, "200k"},
+
+		// 10x10 blocks, 1 bit — 602 bytes/frame (2.7x improvement)
+		{"10x10_1bit_300B_500k", 10, 1, 300, "500k"},
+		{"10x10_1bit_600B_500k", 10, 1, 600, "500k"},
+		{"10x10_1bit_300B_200k", 10, 1, 300, "200k"},
+
+		// 8x8 blocks, 1 bit — 958 bytes/frame (4.3x improvement)
+		{"8x8_1bit_500B_500k", 8, 1, 500, "500k"},
+		{"8x8_1bit_900B_500k", 8, 1, 900, "500k"},
+		{"8x8_1bit_500B_200k", 8, 1, 500, "200k"},
 	}
 
 	tmpDir := t.TempDir()

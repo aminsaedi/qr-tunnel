@@ -97,6 +97,7 @@ type Config struct {
 	WindowSize    int           // sliding window in KB (default 32)
 	RetransmitMin time.Duration // minimum retransmit timeout (default 1s)
 	AckInterval   time.Duration // ACK interval (default 200ms)
+	AdaptiveRate  bool          // enable adaptive send rate (for Bale/VP9)
 }
 
 func DefaultConfig() Config {
@@ -104,7 +105,7 @@ func DefaultConfig() Config {
 		BitmapConfig:  bitmap.DefaultConfig(),
 		FPS:           15,
 		WindowSize:    32,
-		RetransmitMin: 2 * time.Second, // Quick retransmit for corrupted frames
+		RetransmitMin: 1 * time.Second, // Fast retransmit for VP9 frame loss
 		AckInterval:   200 * time.Millisecond,
 	}
 }
@@ -124,6 +125,9 @@ type Transport struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 
+	// Adaptive rate controller (nil if not enabled)
+	adaptive *AdaptiveController
+
 	// Metrics
 	BytesSent     atomic.Int64
 	BytesReceived atomic.Int64
@@ -139,16 +143,33 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 		decoder:     bitmap.NewDecoder(config.BitmapConfig),
 		config:      config,
 		streams:     make(map[uint16]*Stream),
-		sendQueue:   make(chan *transportFrame, 256),
+		sendQueue:   make(chan *transportFrame, 1024),
 		acceptQueue: make(chan *Stream, 16),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
 	t.RTTEstimate.Store(int64(500 * time.Millisecond))
 
+	// Enable adaptive rate controller for VP9 video codecs
+	if config.AdaptiveRate {
+		t.adaptive = newAdaptiveController(t.decoder, config.BitmapConfig.MaxPayloadBytes(), 200*time.Millisecond)
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					t.adaptive.Evaluate()
+				}
+			}
+		}()
+	}
+
 	// Wire up frame callbacks — decode bitmap frames in a goroutine
 	// to prevent blocking the sendLoop (decoder is CPU-intensive)
-	decodeCh := make(chan *image.RGBA, 5)
+	decodeCh := make(chan *image.RGBA, 10)
 	p.OnFrame(func(f *provider.Frame) {
 		select {
 		case decodeCh <- f.Image:
@@ -161,14 +182,14 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 			_, payload, err := t.decoder.DecodeFrame(img)
 			if err != nil {
 				// Yield CPU to prevent starving the sendLoop goroutine
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(5 * time.Millisecond)
 				continue
 			}
 			if payload != nil {
 				t.handleIncomingData(payload)
 			}
-			// Rate limit successful decodes — no need to decode faster than send rate
-			time.Sleep(50 * time.Millisecond)
+			// Brief yield — decode as fast as frames arrive
+			time.Sleep(10 * time.Millisecond)
 		}
 	}()
 
@@ -340,6 +361,7 @@ func (t *Transport) handleFrame(f *transportFrame) {
 // sendLoop pulls frames from the send queue and encodes them into bitmap frames.
 func (t *Transport) sendLoop() {
 	iteration := 0
+	fixedTick := 150 * time.Millisecond
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -348,67 +370,73 @@ func (t *Transport) sendLoop() {
 		}
 
 		iteration++
-		if iteration%10 == 1 {
-			log.Printf("[sendLoop] tick #%d, queue=%d", iteration, len(t.sendQueue))
+		if iteration%20 == 1 {
+			tick := fixedTick
+			if t.adaptive != nil {
+				tick = t.adaptive.TickInterval()
+			}
+			log.Printf("[sendLoop] tick #%d, queue=%d, interval=%dms", iteration, len(t.sendQueue), tick.Milliseconds())
 		}
 
 		t.sendPendingFrames()
-		time.Sleep(250 * time.Millisecond)
+
+		// Use adaptive tick if available
+		if t.adaptive != nil {
+			time.Sleep(t.adaptive.TickInterval())
+		} else {
+			time.Sleep(fixedTick)
+		}
 	}
 }
 
-func (t *Transport) sendPendingFrames() {
+// sendPendingFrames packs and sends one bitmap frame. Returns true if data was sent.
+func (t *Transport) sendPendingFrames() bool {
 	maxPayload := t.config.BitmapConfig.MaxPayloadBytes()
 	var packed []byte
 	queueLen := len(t.sendQueue)
 
-	// Take frames from the queue (prioritize new data)
+	// PRIORITY 1: ACKs and retransmits — these unblock the receiver.
+	// Without retransmits, the receiver stalls on missing sequences forever.
+	t.mu.RLock()
+	for _, s := range t.streams {
+		for _, f := range s.getPendingFrames() {
+			encoded := encodeTransportFrame(f)
+			if len(packed)+len(encoded) > maxPayload {
+				break
+			}
+			packed = append(packed, encoded...)
+		}
+	}
+	t.mu.RUnlock()
+
+	// PRIORITY 2: Fill remaining space with new data from queue
 	for {
 		select {
 		case frame := <-t.sendQueue:
 			encoded := encodeTransportFrame(frame)
 			if len(packed)+len(encoded) > maxPayload {
-				// Batch is full — send it and save this frame for next tick
-				if len(packed) > 0 {
-					t.sendData(packed)
-					// Re-queue the frame that didn't fit (non-blocking)
-					select {
-					case t.sendQueue <- frame:
-					default:
-					}
-					return // Only 1 sendData per tick
+				// Re-queue the frame that didn't fit
+				select {
+				case t.sendQueue <- frame:
+				default:
 				}
-				packed = encoded
-			} else {
-				packed = append(packed, encoded...)
+				goto sendIt
 			}
+			packed = append(packed, encoded...)
 		default:
-			goto doneQueue
+			goto sendIt
 		}
 	}
-doneQueue:
 
-	// If nothing from queue, check retransmits and ACKs
-	if len(packed) == 0 {
-		t.mu.RLock()
-		for _, s := range t.streams {
-			for _, f := range s.getPendingFrames() {
-				encoded := encodeTransportFrame(f)
-				if len(packed)+len(encoded) > maxPayload {
-					break // Don't overflow
-				}
-				packed = append(packed, encoded...)
-			}
-		}
-		t.mu.RUnlock()
-	}
-
+sendIt:
 	if len(packed) > 0 {
 		if queueLen > 0 {
 			log.Printf("[transport] sendPending: queue=%d packed=%d bytes", queueLen, len(packed))
 		}
 		t.sendData(packed)
+		return true
 	}
+	return false
 }
 
 func (t *Transport) sendData(data []byte) {
@@ -423,6 +451,9 @@ func (t *Transport) sendData(data []byte) {
 	}
 	if err := t.provider.SendFrame(frame); err == nil {
 		t.BytesSent.Add(int64(len(data)))
+		if t.adaptive != nil {
+			t.adaptive.FramesSent.Add(1)
+		}
 	}
 }
 

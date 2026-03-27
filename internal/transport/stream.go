@@ -36,10 +36,11 @@ type Stream struct {
 	recvBuf    bytes.Buffer
 	recvMu     sync.Mutex
 	recvNotify chan struct{}
-	recvSeq    uint32            // next expected sequence number (for ACK)
+	recvSeq    uint32            // cumulative in-order ack number
 	recvNext   uint32            // next expected seq for ordered delivery
 	recvQueue  map[uint32][]byte // out-of-order segments waiting for reassembly
 	needsAck   bool
+	ackPending int               // count of unacked DATA frames (for batching)
 
 	// SYN payload (connection metadata)
 	synPayload []byte
@@ -81,6 +82,11 @@ func (s *Stream) WaitOpen(timeout time.Duration) error {
 	}
 }
 
+// maxInFlight limits unACKed frames per stream. This prevents any single stream
+// from flooding the send queue, keeping round-trip latency low for all streams.
+// At ~1 frame/sec through Bale VP9, 4 in-flight = ~4 seconds of data.
+const maxInFlight = 4
+
 // Write sends data over the stream.
 func (s *Stream) Write(data []byte) (int, error) {
 	if s.closed.Load() {
@@ -96,11 +102,33 @@ func (s *Stream) Write(data []byte) (int, error) {
 	written := 0
 
 	for written < len(data) {
+		if s.closed.Load() {
+			return written, io.ErrClosedPipe
+		}
+
+		// Flow control: wait if too many frames in flight (unACKed)
+		for i := 0; i < 100; i++ {
+			s.sendMu.Lock()
+			inFlight := len(s.sendBuf)
+			s.sendMu.Unlock()
+			if inFlight < maxInFlight {
+				break
+			}
+			// Wait for ACKs to drain the send buffer
+			time.Sleep(150 * time.Millisecond)
+			if s.closed.Load() {
+				return written, io.ErrClosedPipe
+			}
+		}
+
 		end := written + maxChunk
 		if end > len(data) {
 			end = len(data)
 		}
-		chunk := data[written:end]
+		// Copy chunk data — the caller's buffer (from io.Copy) may be reused
+		// before the transport layer encodes this frame.
+		chunk := make([]byte, end-written)
+		copy(chunk, data[written:end])
 
 		seq := s.sendSeq.Add(1)
 
@@ -113,8 +141,6 @@ func (s *Stream) Write(data []byte) (int, error) {
 		s.sendMu.Unlock()
 
 		// Queue for sending
-		chunkHash := crc32.ChecksumIEEE(chunk)
-		log.Printf("[stream] Write: stream=%d seq=%d chunk=%d bytes hash=%08x", s.ID, seq, len(chunk), chunkHash)
 		s.transport.sendQueue <- &transportFrame{
 			Flags:      FlagDATA,
 			StreamID:   s.ID,
@@ -174,10 +200,15 @@ func (s *Stream) handleData(seqNum uint32, data []byte) {
 	defer s.recvMu.Unlock()
 
 	dataHash := crc32.ChecksumIEEE(data)
-	log.Printf("[stream] handleData: stream=%d seq=%d data=%d bytes hash=%08x", s.ID, seqNum, len(data), dataHash)
+	log.Printf("[stream] handleData: stream=%d seq=%d data=%d bytes hash=%08x recvNext=%d", s.ID, seqNum, len(data), dataHash, s.recvNext)
 
-	s.needsAck = true
-	s.recvSeq = seqNum
+	s.ackPending++
+	// Batch ACKs: send after every 4 DATA frames to reduce ACK overhead.
+	// Each ACK is 19 bytes in a ~960 byte frame — wasteful if sent alone.
+	if s.ackPending >= 4 {
+		s.needsAck = true
+		s.ackPending = 0
+	}
 
 	if seqNum == s.recvNext {
 		// In-order: write directly to buffer
@@ -203,6 +234,16 @@ func (s *Stream) handleData(seqNum uint32, data []byte) {
 		}
 	}
 	// else: duplicate or old segment, ignore
+
+	// ACK the cumulative in-order boundary (not the raw received seq).
+	// This ensures the sender only removes segments that have been delivered in order.
+	newAck := s.recvNext - 1
+	if newAck > s.recvSeq {
+		s.recvSeq = newAck
+		// Always ACK when the in-order frontier advances (triggers retransmit of next gap)
+		s.needsAck = true
+		s.ackPending = 0
+	}
 
 	// Notify readers
 	select {

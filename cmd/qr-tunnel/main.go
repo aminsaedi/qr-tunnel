@@ -351,8 +351,8 @@ func runBaleClient(args []string) {
 	socksAddr := fs.String("socks5", ":1080", "SOCKS5 listen address")
 	httpAddr := fs.String("http", ":8080", "HTTP CONNECT proxy address (for Telegram)")
 	fps := fs.Int("fps", 15, "send loop frames per second")
-	blockSize := fs.Int("block-size", 16, "bitmap block size in pixels")
-	bitsPerBlock := fs.Int("bits-per-block", 2, "bits per block (1 or 2)")
+	blockSize := fs.Int("block-size", 16, "bitmap block size in pixels (16=reliable through VP9)")
+	bitsPerBlock := fs.Int("bits-per-block", 1, "bits per block (1 or 2, default 1 for Bale VP9 survival)")
 	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -369,13 +369,14 @@ func runBaleClient(args []string) {
 	}
 	defer p.Close()
 
-	// Create transport
+	// Create transport with adaptive rate for VP9 video codecs
 	tConfig := transport.DefaultConfig()
 	tConfig.BitmapConfig = bitmap.Config{
 		BlockSize:    *blockSize,
 		BitsPerBlock: *bitsPerBlock,
 	}
 	tConfig.FPS = *fps
+	tConfig.AdaptiveRate = true
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 
@@ -411,8 +412,8 @@ func runBaleServer(args []string) {
 	fs := flag.NewFlagSet("bale-server", flag.ExitOnError)
 	bridge := fs.String("bridge", "ws://localhost:9001", "browser bridge WebSocket URL")
 	fps := fs.Int("fps", 15, "send loop frames per second")
-	blockSize := fs.Int("block-size", 16, "bitmap block size in pixels")
-	bitsPerBlock := fs.Int("bits-per-block", 2, "bits per block (1 or 2)")
+	blockSize := fs.Int("block-size", 16, "bitmap block size in pixels (16=reliable through VP9)")
+	bitsPerBlock := fs.Int("bits-per-block", 1, "bits per block (1 or 2, default 1 for Bale VP9 survival)")
 	_ = fs.Parse(args)
 
 	log.SetFlags(log.Ltime | log.Lmicroseconds)
@@ -429,13 +430,14 @@ func runBaleServer(args []string) {
 	}
 	defer p.Close()
 
-	// Create transport
+	// Create transport with adaptive rate for VP9 video codecs
 	tConfig := transport.DefaultConfig()
 	tConfig.BitmapConfig = bitmap.Config{
 		BlockSize:    *blockSize,
 		BitsPerBlock: *bitsPerBlock,
 	}
 	tConfig.FPS = *fps
+	tConfig.AdaptiveRate = true
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 

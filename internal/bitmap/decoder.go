@@ -129,10 +129,11 @@ func (d *Decoder) sampleBlock(frame *image.RGBA, bx, by, bs int) uint8 {
 	px := bx * bs
 	py := by * bs
 
-	// Sample center 3/4 of the block for maximum noise averaging
+	// Sample center of block, avoiding edges where VP9 blur is worst.
+	// Minimum margin of 2 pixels for blocks ≤12px (VP9 blur spans ~2px).
 	margin := bs / 8
-	if margin < 1 {
-		margin = 1
+	if margin < 2 {
+		margin = 2
 	}
 	startX := px + margin
 	startY := py + margin
@@ -143,13 +144,18 @@ func (d *Decoder) sampleBlock(frame *image.RGBA, bx, by, bs int) uint8 {
 
 	var sum int64
 	count := 0
+	stride := frame.Stride
+	pix := frame.Pix
 	for y := startY; y < startY+sampleSize && y < FrameHeight; y++ {
+		off := y*stride + startX*4
 		for x := startX; x < startX+sampleSize && x < FrameWidth; x++ {
-			r, g, b, _ := frame.At(x, y).RGBA()
-			// Luminance from RGB (fast approximation)
-			lum := (r*299 + g*587 + b*114) / 1000
-			sum += int64(lum >> 8) // RGBA returns 0-65535, we want 0-255
+			r := int64(pix[off])
+			g := int64(pix[off+1])
+			b := int64(pix[off+2])
+			// Luminance from RGB (fast approximation using 0-255 values)
+			sum += (r*299 + g*587 + b*114) / 1000
 			count++
+			off += 4
 		}
 	}
 

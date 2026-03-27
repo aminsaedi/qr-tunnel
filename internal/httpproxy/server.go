@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,19 +15,28 @@ import (
 	"github.com/aminsaedi/qr-tunnel/internal/transport"
 )
 
+// MaxConcurrentStreams limits parallel tunnel streams to prevent overwhelming
+// the low-bandwidth bitmap channel. Telegram needs just 1-2 working connections.
+// Excess connections queue (up to 30s) — Telegram retries automatically.
+const MaxConcurrentStreams = 2
+
 // Server implements an HTTP CONNECT proxy that routes through the QR transport.
 // This is compatible with Telegram's HTTP proxy setting.
 type Server struct {
 	transport *transport.Transport
 	listener  net.Listener
 	nextID    atomic.Uint32
+	streamSem chan struct{} // concurrency limiter
 
 	ActiveConns atomic.Int32
 	TotalConns  atomic.Int64
 }
 
 func NewServer(t *transport.Transport) *Server {
-	return &Server{transport: t}
+	return &Server{
+		transport: t,
+		streamSem: make(chan struct{}, MaxConcurrentStreams),
+	}
 }
 
 func (s *Server) Start(addr string) error {
@@ -81,21 +91,37 @@ func (s *Server) handleConnect(conn net.Conn, req *http.Request) {
 		dst = net.JoinHostPort(dst, "443") // default HTTPS port
 	}
 
-	log.Printf("[http-proxy] CONNECT %s", dst)
+	// Reject IPv6 — server likely has no IPv6, saves tunnel bandwidth
+	host, _, _ := net.SplitHostPort(dst)
+	if strings.Contains(host, ":") {
+		log.Printf("[http-proxy] CONNECT %s: rejecting IPv6", dst)
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
 
-	// Clear deadline for relay
+	log.Printf("[http-proxy] CONNECT %s (waiting for slot, %d/%d)", dst, len(s.streamSem), MaxConcurrentStreams)
+
+	// Limit concurrent stream SETUP only
+	select {
+	case s.streamSem <- struct{}{}:
+	case <-time.After(10 * time.Second):
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 503 Service Unavailable\r\n\r\n")
+		return
+	}
+
 	_ = conn.SetDeadline(time.Time{})
 
-	// Open transport stream
 	streamID := s.transport.NextStreamID()
 	stream := s.transport.OpenStream(streamID, []byte(dst))
 
-	if err := stream.WaitOpen(90 * time.Second); err != nil {
+	if err := stream.WaitOpen(15 * time.Second); err != nil {
+		<-s.streamSem
 		log.Printf("[http-proxy] stream open failed: %v", err)
 		_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		stream.Close()
 		return
 	}
+	<-s.streamSem // release — stream established
 
 	// Send 200 Connection Established
 	_, _ = fmt.Fprintf(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -126,19 +152,35 @@ func (s *Server) handleHTTP(conn net.Conn, req *http.Request) {
 		host = net.JoinHostPort(host, "80")
 	}
 
+	// Reject IPv6
+	h, _, _ := net.SplitHostPort(host)
+	if strings.Contains(h, ":") {
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
+		return
+	}
+
 	log.Printf("[http-proxy] HTTP %s %s", req.Method, req.URL)
+
+	select {
+	case s.streamSem <- struct{}{}:
+	case <-time.After(10 * time.Second):
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 503 Service Unavailable\r\n\r\n")
+		return
+	}
 
 	_ = conn.SetDeadline(time.Time{})
 
 	streamID := s.transport.NextStreamID()
 	stream := s.transport.OpenStream(streamID, []byte(host))
 
-	if err := stream.WaitOpen(90 * time.Second); err != nil {
+	if err := stream.WaitOpen(15 * time.Second); err != nil {
+		<-s.streamSem
 		log.Printf("[http-proxy] stream open failed: %v", err)
 		_, _ = fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
 		stream.Close()
 		return
 	}
+	<-s.streamSem
 
 	// Forward the original request to the stream
 	_ = req.Write(stream)
