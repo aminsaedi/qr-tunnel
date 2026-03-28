@@ -18,17 +18,26 @@ import (
 
 const frameHeaderSize = 8
 
+// DataChannel marker byte — prefixed to WebSocket messages to distinguish
+// DataChannel transport data from legacy bitmap/JPEG frames.
+const dcMarker byte = 0xDC
+
 // BaleProvider implements provider.CallProvider by connecting to a browser
 // bridge WebSocket. The browser handles the actual Bale video call, and
 // this provider exchanges JPEG-encoded video frames over the WS.
+// It also supports a DataChannel mode where raw bytes are forwarded
+// through the browser's LiveKit DataChannel for much higher throughput.
 type BaleProvider struct {
 	conn    *websocket.Conn
 	onFrame func(*provider.Frame)
 	onState func(provider.State)
+	onData  func([]byte) // callback for DataChannel data
 	state   provider.State
 	seq     uint32
 	txCount int
 	rxCount int
+	dcTx    int
+	dcRx    int
 	mu      sync.Mutex
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -115,6 +124,18 @@ func (p *BaleProvider) readLoop() {
 			continue
 		}
 
+		// Check for DataChannel marker
+		if len(data) > 0 && data[0] == dcMarker {
+			if p.onData != nil {
+				p.onData(data[1:])
+			}
+			p.dcRx++
+			if p.dcRx%100 == 1 {
+				log.Printf("[bale] dc-rx #%d (%d bytes)", p.dcRx, len(data)-1)
+			}
+			continue
+		}
+
 		// Binary message: video frame [4B seq][2B width][2B height][JPEG data]
 		if len(data) <= frameHeaderSize {
 			continue
@@ -192,6 +213,32 @@ func (p *BaleProvider) OnFrame(cb func(*provider.Frame)) {
 
 func (p *BaleProvider) OnState(cb func(provider.State)) {
 	p.onState = cb
+}
+
+// SendData sends raw bytes through the DataChannel path (bridge forwards to _reliable DC).
+func (p *BaleProvider) SendData(data []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.conn == nil {
+		return fmt.Errorf("not connected")
+	}
+
+	buf := make([]byte, 1+len(data))
+	buf[0] = dcMarker
+	copy(buf[1:], data)
+
+	err := p.conn.Write(p.ctx, websocket.MessageBinary, buf)
+	p.dcTx++
+	if p.dcTx%100 == 1 {
+		log.Printf("[bale] dc-tx #%d (%d bytes)", p.dcTx, len(data))
+	}
+	return err
+}
+
+// OnData registers a callback for raw DataChannel data received from the bridge.
+func (p *BaleProvider) OnData(cb func([]byte)) {
+	p.onData = cb
 }
 
 func (p *BaleProvider) LocalDescription() string {

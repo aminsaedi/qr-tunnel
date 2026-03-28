@@ -23,8 +23,6 @@ func NewDecoder(config Config) *Decoder {
 }
 
 // DecodeFrame attempts to decode a bitmap frame.
-// Returns the sequence number, payload, and any error.
-// Returns error if frame is not a valid bitmap frame or CRC fails.
 func (d *Decoder) DecodeFrame(frame *image.RGBA) (uint16, []byte, error) {
 	d.FramesProcessed.Add(1)
 
@@ -37,19 +35,16 @@ func (d *Decoder) DecodeFrame(frame *image.RGBA) (uint16, []byte, error) {
 	bs := d.config.BlockSize
 	grid := d.config.GridSize()
 
-	// Verify border checkerboard to confirm this is a bitmap frame
 	if !d.verifyBorder(frame, grid, bs) {
 		d.FramesFailed.Add(1)
 		return 0, nil, fmt.Errorf("not a bitmap frame (border check failed)")
 	}
 
-	// Read all inner blocks
 	inner := d.config.InnerGridSize()
 	blockValues := make([]uint8, inner*inner)
-
 	for by := 0; by < inner; by++ {
 		for bx := 0; bx < inner; bx++ {
-			lum := d.sampleBlock(frame, bx+1, by+1, bs) // +1 for border
+			lum := d.sampleBlock(frame, bx+1, by+1, bs)
 			blockValues[by*inner+bx] = d.luminanceToValue(lum)
 		}
 	}

@@ -17,6 +17,7 @@ const FAKE_CAMERA = '/tmp/qr-fake-camera.y4m';
 console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort}`);
 
 let goSocket = null, page = null, callActive = false;
+let dcMode = false; // DataChannel transport mode active
 
 // --- WS server ---
 const wss = new WebSocketServer({ port: wsPort });
@@ -25,8 +26,16 @@ wss.on('connection', ws => {
   console.log('[bridge] Go connected');
   goSocket = ws;
   if (callActive) ws.send('connected');
-  ws.on('message', data => { if (data instanceof Buffer && data.length > 8) drawQRFrame(data); });
-  ws.on('close', () => { goSocket = null; });
+  ws.on('message', data => {
+    if (data instanceof Buffer && data.length > 0 && data[0] === 0xDC) {
+      // DataChannel mode: forward payload to _reliable local DC
+      forwardToDC(data.slice(1));
+    } else if (data instanceof Buffer && data.length > 8) {
+      // Legacy bitmap mode: draw to canvas
+      drawQRFrame(data);
+    }
+  });
+  ws.on('close', () => { goSocket = null; dcMode = false; });
 });
 
 function sendToGo(jpegBuf, seq) {
@@ -34,6 +43,58 @@ function sendToGo(jpegBuf, seq) {
   const hdr = Buffer.alloc(8);
   hdr.writeUInt32BE(seq, 0); hdr.writeUInt16BE(720, 4); hdr.writeUInt16BE(720, 6);
   try { goSocket.send(Buffer.concat([hdr, jpegBuf])); } catch {}
+}
+
+// --- DataChannel transport ---
+
+let dcTxCount = 0, dcRxCount = 0;
+
+async function forwardToDC(payload) {
+  if (!page) return;
+  try {
+    const b64 = payload.toString('base64');
+    const sent = await page.evaluate((b64) => {
+      const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+
+      // Wrap in LiveKit DataPacket protobuf
+      function encodeVarint(v) {
+        const bytes = [];
+        while (v > 0x7f) { bytes.push((v & 0x7f) | 0x80); v >>>= 7; }
+        bytes.push(v & 0x7f);
+        return bytes;
+      }
+      // UserPacket { payload(2): raw, topic(5): "t" }
+      const topicBytes = [0x2a, 0x01, 0x74]; // field 5, len 1, "t"
+      const userPayloadTag = [0x12];
+      const userPayloadLen = encodeVarint(raw.length);
+      const userPacket = new Uint8Array([...userPayloadTag, ...userPayloadLen, ...raw, ...topicBytes]);
+      // DataPacket { kind(1): RELIABLE, user(2): userPacket }
+      const dpKind = [0x08, 0x00];
+      const dpUserTag = [0x12];
+      const dpUserLen = encodeVarint(userPacket.length);
+      const dataPacket = new Uint8Array([...dpKind, ...dpUserTag, ...dpUserLen, ...userPacket]);
+
+      // Use the SAME DataChannel object that LiveKit uses (captured via send hook)
+      const dc = window.__lkSendDC || (window.__dcAll || []).find(d => d.label === '_reliable' && d.dir === 'local' && d.dc.readyState === 'open')?.dc;
+      if (!dc || dc.readyState !== 'open') return false;
+      dc.send(dataPacket);
+      return 'proto';
+    }, b64);
+    if (sent) {
+      dcTxCount++;
+      if (dcTxCount % 100 === 1) console.log(`[DC-tx] #${dcTxCount} via ${sent} (${payload.length} bytes)`);
+    } else {
+      if (dcTxCount === 0) console.log('[DC-tx] no DC available, dropping');
+    }
+  } catch (e) {
+    if (dcTxCount % 100 === 0) console.log(`[DC-tx] error: ${e.message}`);
+  }
+}
+
+function sendDCToGo(payload) {
+  if (!goSocket || goSocket.readyState !== 1) return;
+  const header = Buffer.alloc(1, 0xDC);
+  try { goSocket.send(Buffer.concat([header, Buffer.from(payload)])); } catch {}
 }
 
 let txCount = 0;
@@ -89,11 +150,92 @@ const INIT_SCRIPT = `
     pc.addEventListener('datachannel', (e) => {
       console.log('[DC] remote datachannel: ' + e.channel.label);
       window.__dcAll.push({label: e.channel.label, dc: e.channel, pc, dir:'remote'});
+      // Hook _reliable remote DC to forward tunnel data
+      if (e.channel.label === '_reliable') {
+        window.__dcRemoteRxTotal = 0;
+        window.__dcRemoteParsed = 0;
+        e.channel.addEventListener('message', (evt) => {
+          window.__dcRemoteRxTotal++;
+          if (!window.__dcRecvQueue) window.__dcRecvQueue = [];
+          const data = evt.data;
+          if (data instanceof ArrayBuffer) {
+            const arr = new Uint8Array(data);
+            if (window.__dcRemoteRxTotal <= 5) {
+              console.log('[DC-debug] remote _reliable msg #' + window.__dcRemoteRxTotal + ' size=' + arr.length + ' first5=[' + Array.from(arr.slice(0,5)).map(b=>('0'+b.toString(16)).slice(-2)).join(',') + ']');
+            }
+            const payload = window.__extractLKPayload(arr);
+            if (payload && payload.length > 0) {
+              window.__dcRemoteParsed++;
+              window.__dcRecvQueue.push(Array.from(payload));
+              if (window.__dcRemoteParsed <= 3) {
+                console.log('[DC-debug] parsed payload size=' + payload.length);
+              }
+            }
+          }
+        });
+        console.log('[DC] hooked _reliable remote for tunnel forwarding');
+      }
     });
     return pc;
   };
   window.RTCPeerConnection.prototype = _origPC.prototype;
   Object.keys(_origPC).forEach(k => { try { window.RTCPeerConnection[k] = _origPC[k]; } catch(e){} });
+
+  // Extract payload from LiveKit DataPacket protobuf
+  // DataPacket { kind(1): varint, user(2): UserPacket { payload(2): bytes } }
+  window.__extractLKPayload = function(buf) {
+    let i = 0;
+    let userStart = -1, userEnd = -1;
+    while (i < buf.length) {
+      const tag = buf[i++];
+      const fieldNum = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) { // varint
+        while (i < buf.length && buf[i] & 0x80) i++;
+        i++;
+      } else if (wireType === 2) { // length-delimited
+        let len = 0, shift = 0;
+        while (i < buf.length && buf[i] & 0x80) { len |= (buf[i++] & 0x7f) << shift; shift += 7; }
+        len |= (buf[i++] & 0x7f) << shift;
+        if (fieldNum === 2 && userStart === -1) { userStart = i; userEnd = i + len; }
+        i += len;
+      } else {
+        break; // unknown wire type
+      }
+    }
+    if (userStart < 0) return null;
+    // Now parse UserPacket to find field 2 (payload)
+    i = userStart;
+    while (i < userEnd) {
+      const tag = buf[i++];
+      const fieldNum = tag >> 3;
+      const wireType = tag & 0x07;
+      if (wireType === 0) {
+        while (i < userEnd && buf[i] & 0x80) i++;
+        i++;
+      } else if (wireType === 2) {
+        let len = 0, shift = 0;
+        while (i < userEnd && buf[i] & 0x80) { len |= (buf[i++] & 0x7f) << shift; shift += 7; }
+        len |= (buf[i++] & 0x7f) << shift;
+        if (fieldNum === 2) { return buf.slice(i, i + len); } // payload!
+        i += len;
+      } else {
+        break;
+      }
+    }
+    return null;
+  };
+  // Hook RTCDataChannel.send to capture LiveKit's _reliable DC send function
+  const _origDCSend = RTCDataChannel.prototype.send;
+  window.__lkSendDC = null;
+  RTCDataChannel.prototype.send = function(data) {
+    if (this.label === '_reliable' && !window.__lkSendDC) {
+      window.__lkSendDC = this;
+      console.log('[DC] captured _reliable DC reference via send hook');
+    }
+    return _origDCSend.call(this, data);
+  };
+
   window.__frameN = 0;
 
   const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
@@ -163,6 +305,10 @@ const INIT_SCRIPT = `
       processor.readable.pipeThrough(transformer).pipeTo(generator.writable);
 
       // Build output stream: transformed video + real audio
+      // Set contentHint to 'detail' — tells VP9 to use screen-content mode
+      // which preserves sharp block edges much better than camera mode
+      generator.contentHint = 'detail';
+
       const outputStream = new MediaStream();
       outputStream.addTrack(generator);
       realStream.getAudioTracks().forEach(t => outputStream.addTrack(t));
@@ -264,6 +410,11 @@ async function main() {
   page = context.pages()[0] || await context.newPage();
   await page.addInitScript(INIT_SCRIPT);
 
+  // Forward page console messages with [DC] prefix
+  page.on('console', msg => {
+    if (msg.text().includes('[DC]')) console.log(msg.text());
+  });
+
   console.log('[bridge] Opening Bale...');
   if (role === 'caller') {
     await page.goto(`https://web.bale.ai/chat?uid=${targetUser}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
@@ -290,6 +441,10 @@ async function main() {
   startCapture(page);
   console.log('[bridge] Running.');
 
+  // Install DataChannel receive handler AFTER call connects
+  // (init script hooks may miss LiveKit's PeerConnections that load before our hooks)
+  await setupDCReceiver(page);
+
   // Log DataChannel state every 10 seconds
   setInterval(async () => {
     try {
@@ -303,6 +458,29 @@ async function main() {
       }
     } catch {}
   }, 10000);
+
+  // Poll for DataChannel receive queue (remote DC → Go)
+  // We poll at high frequency to minimize latency
+  setInterval(async () => {
+    if (!goSocket || goSocket.readyState !== 1 || !page) return;
+    try {
+      const messages = await page.evaluate(() => {
+        if (!window.__dcRecvQueue || window.__dcRecvQueue.length === 0) return null;
+        const msgs = window.__dcRecvQueue;
+        window.__dcRecvQueue = [];
+        return msgs;
+      });
+      if (messages && messages.length > 0) {
+        for (const msg of messages) {
+          sendDCToGo(Buffer.from(msg));
+          dcRxCount++;
+        }
+        if (dcRxCount % 100 < messages.length) {
+          console.log(`[DC-rx] total=${dcRxCount}, batch=${messages.length}`);
+        }
+      }
+    } catch {}
+  }, 10); // 10ms polling — low latency for DataChannel data
 
   process.on('SIGINT', async () => { wss.close(); await context.close(); process.exit(0); });
   await new Promise(() => {});
@@ -359,6 +537,79 @@ async function findAndClick(page, texts, timeout = 15000) {
     await sleep(500);
   }
   console.log(`[bridge] WARN: [${texts.join(',')}] not found`);
+}
+
+async function setupDCReceiver(pg) {
+  const result = await pg.evaluate(() => {
+    if (!window.__dcRecvQueue) window.__dcRecvQueue = [];
+    let found = 0;
+
+    // Hook remote _reliable DC message handler
+    for (const entry of (window.__dcAll || [])) {
+      if (entry.label === '_reliable' && entry.dir === 'remote' && entry.dc.readyState === 'open') {
+        if (entry._tunnelHooked) continue;
+        entry._tunnelHooked = true;
+        entry.dc.addEventListener('message', (evt) => {
+          if (evt.data instanceof ArrayBuffer) {
+            const arr = new Uint8Array(evt.data);
+            const payload = window.__extractLKPayload ? window.__extractLKPayload(arr) : null;
+            if (payload && payload.length > 0) {
+              window.__dcRecvQueue.push(Array.from(payload));
+            }
+          }
+        });
+        found++;
+      }
+    }
+
+    // Find LiveKit Room for publishData
+    // LiveKit SDK stores Room references — search common patterns
+    let lkRoom = null;
+    // Method 1: Check global scope
+    for (const key of Object.keys(window)) {
+      try {
+        const obj = window[key];
+        if (obj && obj.localParticipant && typeof obj.localParticipant.publishData === 'function') {
+          lkRoom = obj;
+          break;
+        }
+      } catch(e) {}
+    }
+    // Method 2: Search webpack modules
+    if (!lkRoom) {
+      try {
+        const wc = window.webpackChunk || window.webpackChunkbale_web || [];
+        for (const chunk of wc) {
+          if (!chunk[1]) continue;
+          for (const mod of Object.values(chunk[1])) {
+            try {
+              const m = { exports: {} };
+              mod(m, m.exports, () => null);
+              if (m.exports?.localParticipant?.publishData) { lkRoom = m.exports; break; }
+            } catch(e) {}
+          }
+          if (lkRoom) break;
+        }
+      } catch(e) {}
+    }
+
+    if (lkRoom) {
+      window.__lkRoom = lkRoom;
+      window.__lkPublish = (b64) => {
+        const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+        lkRoom.localParticipant.publishData(raw, { reliable: true, topic: 'tunnel' });
+      };
+      return { found, lkRoom: true, identity: lkRoom.localParticipant?.identity || '?' };
+    }
+
+    return { found, lkRoom: false };
+  });
+
+  console.log(`[DC-setup] result: ${JSON.stringify(result)}`);
+
+  if (result.lkRoom) {
+    console.log('[DC-setup] LiveKit Room found! Using publishData API for sending.');
+  }
 }
 
 function startCapture(page) {

@@ -110,6 +110,13 @@ func DefaultConfig() Config {
 	}
 }
 
+// DataChannelProvider is an optional interface for providers that support
+// raw DataChannel transport (bypassing bitmap encode/decode for higher throughput).
+type DataChannelProvider interface {
+	SendData(data []byte) error
+	OnData(cb func([]byte))
+}
+
 // Transport provides reliable multiplexed streams over a bitmap channel.
 type Transport struct {
 	provider    provider.CallProvider
@@ -124,6 +131,9 @@ type Transport struct {
 	acceptQueue chan *Stream
 	ctx         context.Context
 	cancel      context.CancelFunc
+
+	// DataChannel direct send (bypasses bitmap encoding)
+	sendDataDirect func(data []byte) error
 
 	// Adaptive rate controller (nil if not enabled)
 	adaptive *AdaptiveController
@@ -149,6 +159,13 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 		cancel:      cancel,
 	}
 	t.RTTEstimate.Store(int64(500 * time.Millisecond))
+
+	// DataChannel provider disabled for now — LiveKit SFU drops our protobuf messages.
+	// TODO: fix DataChannel encoding to match LiveKit's exact format.
+	// if dcp, ok := p.(DataChannelProvider); ok {
+	// 	t.sendDataDirect = dcp.SendData
+	// 	dcp.OnData(func(data []byte) { t.handleIncomingData(data) })
+	// }
 
 	// Enable adaptive rate controller for VP9 video codecs
 	if config.AdaptiveRate {
@@ -414,10 +431,14 @@ func (t *Transport) handleFrame(f *transportFrame) {
 	}
 }
 
-// sendLoop pulls frames from the send queue and encodes them into bitmap frames.
+// sendLoop pulls frames from the send queue and sends them.
 func (t *Transport) sendLoop() {
 	iteration := 0
-	fixedTick := 150 * time.Millisecond
+	fixedTick := 100 * time.Millisecond
+	// In DataChannel mode, tick much faster for lower latency
+	if t.sendDataDirect != nil {
+		fixedTick = 5 * time.Millisecond
+	}
 	for {
 		select {
 		case <-t.ctx.Done():
@@ -445,9 +466,13 @@ func (t *Transport) sendLoop() {
 	}
 }
 
-// sendPendingFrames packs and sends one bitmap frame. Returns true if data was sent.
+// sendPendingFrames packs and sends one batch of transport frames. Returns true if data was sent.
 func (t *Transport) sendPendingFrames() bool {
 	maxPayload := t.config.BitmapConfig.MaxPayloadBytes()
+	// In DataChannel mode, we can send much larger messages (DC limit ~256KB)
+	if t.sendDataDirect != nil {
+		maxPayload = 64 * 1024 // 64KB per batch — well within DC limits
+	}
 	var packed []byte
 	queueLen := len(t.sendQueue)
 
@@ -494,6 +519,17 @@ fillRetransmits:
 }
 
 func (t *Transport) sendData(data []byte) {
+	// DataChannel mode: send raw transport frames directly (no bitmap encoding)
+	if t.sendDataDirect != nil {
+		if err := t.sendDataDirect(data); err == nil {
+			t.BytesSent.Add(int64(len(data)))
+		} else {
+			log.Printf("[transport] DC send error: %v", err)
+		}
+		return
+	}
+
+	// Legacy bitmap mode: encode into image frame
 	img := t.encoder.EncodePacket(t.nextSeq(), data)
 	if img == nil {
 		return
@@ -518,6 +554,7 @@ type Metrics struct {
 	RTTEstimate   time.Duration
 	ActiveStreams  int
 	DecodeRate    float64 // fraction of frames successfully decoded
+	DCMode        bool    // true if using DataChannel transport
 }
 
 func (t *Transport) Metrics() Metrics {
@@ -537,5 +574,6 @@ func (t *Transport) Metrics() Metrics {
 		RTTEstimate:   time.Duration(t.RTTEstimate.Load()),
 		ActiveStreams:  activeStreams,
 		DecodeRate:    decodeRate,
+		DCMode:        t.sendDataDirect != nil,
 	}
 }
