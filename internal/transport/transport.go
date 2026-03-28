@@ -160,12 +160,14 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	}
 	t.RTTEstimate.Store(int64(500 * time.Millisecond))
 
-	// DataChannel provider disabled for now — LiveKit SFU drops our protobuf messages.
-	// TODO: fix DataChannel encoding to match LiveKit's exact format.
-	// if dcp, ok := p.(DataChannelProvider); ok {
-	// 	t.sendDataDirect = dcp.SendData
-	// 	dcp.OnData(func(data []byte) { t.handleIncomingData(data) })
-	// }
+	// DataChannel mode: bypass bitmap encoding for direct binary transport
+	if dcp, ok := p.(DataChannelProvider); ok {
+		log.Printf("[transport] DataChannel provider detected — using direct DC transport")
+		t.sendDataDirect = dcp.SendData
+		dcp.OnData(func(data []byte) {
+			t.handleIncomingData(data)
+		})
+	}
 
 	// Enable adaptive rate controller for VP9 video codecs
 	if config.AdaptiveRate {

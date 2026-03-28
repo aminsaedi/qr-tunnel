@@ -56,29 +56,42 @@ async function forwardToDC(payload) {
     const sent = await page.evaluate((b64) => {
       const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
 
-      // Wrap in LiveKit DataPacket protobuf
-      function encodeVarint(v) {
-        const bytes = [];
-        while (v > 0x7f) { bytes.push((v & 0x7f) | 0x80); v >>>= 7; }
-        bytes.push(v & 0x7f);
-        return bytes;
-      }
-      // UserPacket { payload(2): raw, topic(5): "t" }
-      const topicBytes = [0x2a, 0x01, 0x74]; // field 5, len 1, "t"
-      const userPayloadTag = [0x12];
-      const userPayloadLen = encodeVarint(raw.length);
-      const userPacket = new Uint8Array([...userPayloadTag, ...userPayloadLen, ...raw, ...topicBytes]);
-      // DataPacket { kind(1): RELIABLE, user(2): userPacket }
-      const dpKind = [0x08, 0x00];
-      const dpUserTag = [0x12];
-      const dpUserLen = encodeVarint(userPacket.length);
-      const dataPacket = new Uint8Array([...dpKind, ...dpUserTag, ...dpUserLen, ...userPacket]);
+      if (!window.__dcSeq) window.__dcSeq = 0;
+      window.__dcSeq++;
 
-      // Use the SAME DataChannel object that LiveKit uses (captured via send hook)
+      let packetBytes;
+      // Use injected LiveKit protocol SDK if available (exact SFU-compatible encoding)
+      if (window.LKProto && window.LKProto.DataPacket) {
+        const { DataPacket, DataPacket_Kind, UserPacket } = window.LKProto;
+        const userPacket = new UserPacket({ payload: raw });
+        const packet = new DataPacket({
+          kind: DataPacket_Kind.RELIABLE,
+          value: { case: 'user', value: userPacket },
+          sequence: window.__dcSeq,
+        });
+        packetBytes = packet.toBinary();
+      } else {
+        // Fallback: manual protobuf
+        function encodeVarint(v) {
+          const bytes = [];
+          do { bytes.push((v & 0x7f) | (v > 0x7f ? 0x80 : 0)); v >>>= 7; } while (v > 0);
+          return bytes;
+        }
+        function field(num, wireType, data) { return [...encodeVarint((num << 3) | wireType), ...data]; }
+        function fieldVarint(num, val) { return field(num, 0, encodeVarint(val)); }
+        function fieldBytes(num, data) { return field(num, 2, [...encodeVarint(data.length), ...data]); }
+        const userPacket = fieldBytes(2, [...raw]);
+        packetBytes = new Uint8Array([
+          ...fieldVarint(1, 0),
+          ...fieldBytes(2, userPacket),
+          ...fieldVarint(16, window.__dcSeq),
+        ]);
+      }
+
       const dc = window.__lkSendDC || (window.__dcAll || []).find(d => d.label === '_reliable' && d.dir === 'local' && d.dc.readyState === 'open')?.dc;
       if (!dc || dc.readyState !== 'open') return false;
-      dc.send(dataPacket);
-      return 'proto';
+      dc.send(packetBytes);
+      return window.LKProto ? 'sdk' : 'manual';
     }, b64);
     if (sent) {
       dcTxCount++;
@@ -410,6 +423,15 @@ async function main() {
   page = context.pages()[0] || await context.newPage();
   await page.addInitScript(INIT_SCRIPT);
 
+  // Inject LiveKit protocol bundle for correct DataPacket serialization
+  try {
+    const lkBundle = require('fs').readFileSync(path.join(__dirname, 'lk-protocol-bundle.js'), 'utf8');
+    await page.addInitScript(lkBundle);
+    console.log('[bridge] LiveKit protocol bundle injected');
+  } catch (e) {
+    console.log('[bridge] LiveKit protocol bundle not found, using manual protobuf');
+  }
+
   // Forward page console messages with [DC] prefix
   page.on('console', msg => {
     if (msg.text().includes('[DC]')) console.log(msg.text());
@@ -445,17 +467,55 @@ async function main() {
   // (init script hooks may miss LiveKit's PeerConnections that load before our hooks)
   await setupDCReceiver(page);
 
-  // Log DataChannel state every 10 seconds
+  // Log DataChannel state + probe for LiveKit SDK every 10 seconds
   setInterval(async () => {
     try {
-      const dcState = await page.evaluate(() => {
-        return (window.__dcAll || []).map(d => ({
+      const info = await page.evaluate(() => {
+        const dcState = (window.__dcAll || []).map(d => ({
           label: d.label, dir: d.dir, state: d.dc.readyState
         }));
+
+        // Probe for LiveKit SDK objects (DataPacket, Room, etc.)
+        let lkFound = [];
+        // Search all script-accessible globals and module caches
+        function searchObj(obj, path, depth) {
+          if (depth > 3 || !obj || typeof obj !== 'object') return;
+          try {
+            for (const key of Object.getOwnPropertyNames(obj).slice(0, 100)) {
+              try {
+                const v = obj[key];
+                if (typeof v === 'function' && (key === 'DataPacket' || key === 'UserPacket')) {
+                  lkFound.push(path + '.' + key);
+                }
+                if (v && typeof v === 'object' && v.localParticipant && typeof v.localParticipant.publishData === 'function') {
+                  lkFound.push(path + '.' + key + ' (Room with publishData!)');
+                }
+                if (v && typeof v === 'function' && v.name === 'Room' && v.prototype?.localParticipant !== undefined) {
+                  lkFound.push(path + '.' + key + ' (Room constructor)');
+                }
+              } catch(e) {}
+            }
+          } catch(e) {}
+        }
+        searchObj(window, 'window', 0);
+        // Check webpack chunks
+        try {
+          const chunks = window.webpackChunk || window.webpackChunkbale_web || window.webpackChunk_N_E || [];
+          lkFound.push('webpackChunks: ' + chunks.length);
+        } catch(e) {}
+
+        // Check for __lkSendDC (send hook)
+        const sendDC = window.__lkSendDC ? 'captured' : 'null';
+
+        return { dcState, lkFound, sendDC, dcSeq: window.__dcSeq || 0 };
       });
-      if (dcState.length > 0) {
-        console.log('[DC-state]', JSON.stringify(dcState));
+      if (info.dcState.length > 0) {
+        console.log('[DC-state]', JSON.stringify(info.dcState));
       }
+      if (info.lkFound.length > 0) {
+        console.log('[LK-probe]', JSON.stringify(info.lkFound));
+      }
+      console.log(`[DC-info] sendDC=${info.sendDC} dcSeq=${info.dcSeq}`);
     } catch {}
   }, 10000);
 
@@ -552,7 +612,20 @@ async function setupDCReceiver(pg) {
         entry.dc.addEventListener('message', (evt) => {
           if (evt.data instanceof ArrayBuffer) {
             const arr = new Uint8Array(evt.data);
-            const payload = window.__extractLKPayload ? window.__extractLKPayload(arr) : null;
+            let payload = null;
+            // Use SDK decoder if available
+            if (window.LKProto && window.LKProto.DataPacket) {
+              try {
+                const dp = window.LKProto.DataPacket.fromBinary(arr);
+                if (dp.value?.case === 'user' && dp.value.value?.payload) {
+                  payload = dp.value.value.payload;
+                }
+              } catch(e) { /* not a valid DataPacket */ }
+            }
+            // Fallback: manual parser
+            if (!payload) {
+              payload = window.__extractLKPayload ? window.__extractLKPayload(arr) : null;
+            }
             if (payload && payload.length > 0) {
               window.__dcRecvQueue.push(Array.from(payload));
             }
