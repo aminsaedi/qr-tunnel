@@ -29,7 +29,7 @@ func TestRoundTrip(t *testing.T) {
 			t.Fatalf("EncodePacket returned nil for %d bytes", size)
 		}
 
-		seq, decoded, err := dec.DecodeFrame(img)
+		seq, decoded, err := dec.DecodeFrame(img) //nolint:errcheck
 		if err != nil {
 			t.Fatalf("DecodeFrame failed for %d bytes: %v", size, err)
 		}
@@ -60,13 +60,13 @@ func TestDuplicateDetection(t *testing.T) {
 	img := enc.EncodePacket(1, payload)
 
 	// First decode should succeed
-	_, _, err := dec.DecodeFrame(img)
+	_, _, err := dec.DecodeFrame(img) //nolint:errcheck
 	if err != nil {
 		t.Fatalf("first decode failed: %v", err)
 	}
 
 	// Second decode of same seq should be detected as duplicate
-	_, _, err = dec.DecodeFrame(img)
+	_, _, err = dec.DecodeFrame(img) //nolint:errcheck
 	if err == nil {
 		t.Fatal("expected duplicate detection")
 	}
@@ -78,7 +78,7 @@ func TestRejectNonBitmapFrame(t *testing.T) {
 
 	// Create a blank white image (not a bitmap frame)
 	img := makeBlankImage(255)
-	_, _, err := dec.DecodeFrame(img)
+	_, _, err := dec.DecodeFrame(img) //nolint:errcheck
 	if err == nil {
 		t.Fatal("expected error for non-bitmap frame")
 	}
@@ -104,10 +104,10 @@ func TestFallbackBlockSize(t *testing.T) {
 	t.Logf("Fallback config: maxPayload=%d", cfg.MaxPayloadBytes())
 
 	payload := make([]byte, 100)
-	rand.Read(payload)
+	rand.Read(payload) //nolint:errcheck
 
 	img := enc.EncodePacket(99, payload)
-	seq, decoded, err := dec.DecodeFrame(img)
+	seq, decoded, err := dec.DecodeFrame(img) //nolint:errcheck
 	if err != nil {
 		t.Fatalf("fallback decode failed: %v", err)
 	}
@@ -125,7 +125,7 @@ func BenchmarkEncode(b *testing.B) {
 	cfg := DefaultConfig()
 	enc := NewEncoder(cfg)
 	payload := make([]byte, 200)
-	rand.Read(payload)
+	rand.Read(payload) //nolint:errcheck
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -138,13 +138,13 @@ func BenchmarkDecode(b *testing.B) {
 	enc := NewEncoder(cfg)
 	dec := NewDecoder(cfg)
 	payload := make([]byte, 200)
-	rand.Read(payload)
+	rand.Read(payload) //nolint:errcheck
 	img := enc.EncodePacket(0, payload)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		dec.lastSeq = 0 // reset duplicate detection
-		dec.DecodeFrame(img)
+		dec.DecodeFrame(img) //nolint:errcheck
 	}
 }
 

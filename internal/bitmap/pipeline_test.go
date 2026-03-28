@@ -60,7 +60,7 @@ func TestFullPipelineSurvival(t *testing.T) {
 				inPath := filepath.Join(tmpDir, fmt.Sprintf("in_%s_%d.png", name, trial))
 				outPath := filepath.Join(tmpDir, fmt.Sprintf("out_%s_%d.png", name, trial))
 				vpxPath := filepath.Join(tmpDir, fmt.Sprintf("vpx_%s_%d.webm", name, trial))
-				savePNGFromRGBA(jpeg1, inPath)
+				_ = savePNGFromRGBA(jpeg1, inPath)
 
 				// Step 3: VP9 encode/decode
 				cmd := exec.Command("ffmpeg", "-y",

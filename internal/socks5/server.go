@@ -48,7 +48,6 @@ const MaxConcurrentStreams = 2
 type Server struct {
 	transport *transport.Transport
 	listener  net.Listener
-	nextID    atomic.Uint32
 	streamSem chan struct{}
 
 	// Metrics

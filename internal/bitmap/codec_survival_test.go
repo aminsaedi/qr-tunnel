@@ -179,14 +179,14 @@ func TestBitmapSurvivesVP8(t *testing.T) {
 			}
 
 			payload := make([]byte, tt.size)
-			rand.Read(payload)
+			_, _ = rand.Read(payload)
 
 			img := enc.EncodePacket(1, payload)
 			inPath := filepath.Join(tmpDir, fmt.Sprintf("in_%s.png", tt.name))
 			outPath := filepath.Join(tmpDir, fmt.Sprintf("out_%s.png", tt.name))
 			vpxPath := filepath.Join(tmpDir, fmt.Sprintf("vpx_%s.webm", tt.name))
 
-			savePNG(img, inPath)
+			_ = savePNG(img, inPath)
 
 			cmd := exec.Command("ffmpeg", "-y",
 				"-loop", "1", "-i", inPath, "-t", "0.1",
@@ -198,7 +198,7 @@ func TestBitmapSurvivesVP8(t *testing.T) {
 				t.Fatalf("VP8 encode: %v\n%s", err, out)
 			}
 
-			exec.Command("ffmpeg", "-y", "-i", vpxPath, "-frames:v", "1", "-f", "image2", outPath).Run()
+			exec.Command("ffmpeg", "-y", "-i", vpxPath, "-frames:v", "1", "-f", "image2", outPath).Run() //nolint:errcheck
 
 			decoded, err := loadPNG(outPath)
 			if err != nil {

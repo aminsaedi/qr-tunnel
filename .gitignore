@@ -10,3 +10,8 @@ profile-a/
 profile-b/
 bale-analysis/logs/
 bale-analysis/profile-*/
+hossein-bundle.tar.xz
+*.tar.xz
+*.tar.gz
+*.zip
+serve-cli.sh

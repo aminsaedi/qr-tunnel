@@ -1,12 +1,8 @@
 name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      version:
-        description: "Release version (e.g. v0.1.0)"
-        required: true
-        type: string
+  push:
+    tags: ['v*']
 
 permissions:
   contents: write
@@ -24,25 +20,21 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Validate version format
-        run: |
-          if [[ ! "${{ inputs.version }}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "Error: version must match vX.Y.Z (e.g. v0.1.0)"
-            exit 1
-          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
 
       - name: Run tests
         run: go test ./internal/... -race -timeout 120s
 
-      - name: Build and package all targets
+      - name: Build all Go binaries
         env:
           CGO_ENABLED: "0"
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ github.ref_name }}
         run: |
           LDFLAGS="-s -w -X main.Version=${VERSION}"
           mkdir -p dist
 
-          # Build each target, package as tar.gz (unix) or zip (windows)
           for pair in "darwin amd64" "darwin arm64" "linux amd64" "linux arm64" "windows amd64"; do
             OS=$(echo $pair | cut -d' ' -f1)
             ARCH=$(echo $pair | cut -d' ' -f2)
@@ -50,20 +42,110 @@ jobs:
             if [ "$OS" = "windows" ]; then BIN="qr-tunnel.exe"; fi
 
             echo "Building ${OS}/${ARCH}..."
-            GOOS=$OS GOARCH=$ARCH go build -ldflags="$LDFLAGS" -o "dist/${BIN}" ./cmd/qr-tunnel
-
-            cd dist
-            ARCHIVE="qr-tunnel-${OS}-${ARCH}"
-            if [ "$OS" = "windows" ]; then
-              zip "${ARCHIVE}.zip" "$BIN"
-            else
-              tar czf "${ARCHIVE}.tar.gz" "$BIN"
-            fi
-            rm "$BIN"
-            cd ..
+            GOOS=$OS GOARCH=$ARCH go build -ldflags="$LDFLAGS" -o "dist/qr-tunnel-${OS}-${ARCH}/${BIN}" ./cmd/qr-tunnel
           done
 
-          ls -lh dist/
+      - name: Build Linux bundle
+        run: |
+          BUNDLE=dist/qr-tunnel-bundle-linux-amd64
+          mkdir -p $BUNDLE/{scripts,node,bin}
+
+          # Go binary
+          cp dist/qr-tunnel-linux-amd64/qr-tunnel $BUNDLE/
+
+          # Node.js scripts + deps
+          cp bale-integration/bridge.js $BUNDLE/scripts/
+          cp bale-integration/package.json $BUNDLE/scripts/
+          cp bale-integration/lk-protocol-bundle.js $BUNDLE/scripts/
+          cd $BUNDLE/scripts && npm install --production 2>&1 | tail -1
+          cd $GITHUB_WORKSPACE
+
+          # Node.js runtime
+          curl -sL "https://nodejs.org/dist/v22.14.0/node-v22.14.0-linux-x64.tar.xz" | tar xJ --strip-components=1 -C $BUNDLE/node
+          rm -rf $BUNDLE/node/{share,include,CHANGELOG.md,README.md,LICENSE}
+          rm -rf $BUNDLE/node/lib/node_modules $BUNDLE/node/bin/{npm*,npx*,corepack*}
+
+          # ffmpeg
+          curl -sL "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o /tmp/ffmpeg.tar.xz
+          mkdir -p /tmp/ffmpeg-extract && tar xJf /tmp/ffmpeg.tar.xz -C /tmp/ffmpeg-extract
+          cp /tmp/ffmpeg-extract/ffmpeg-*-amd64-static/ffmpeg $BUNDLE/bin/
+
+          # Start script
+          cat > $BUNDLE/start.sh << 'STARTEOF'
+          #!/bin/bash
+          set -euo pipefail
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          export PATH="$SCRIPT_DIR/node/bin:$SCRIPT_DIR/bin:$PATH"
+          export PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+          TARGET_USER="${1:-884923192}"
+          CHROME=""
+          for c in /usr/bin/google-chrome-stable /usr/bin/google-chrome /usr/bin/chromium-browser /usr/bin/chromium /snap/bin/chromium; do
+            [ -x "$c" ] && CHROME="$c" && break
+          done
+          [ -z "$CHROME" ] && { echo "ERROR: Chrome not found"; exit 1; }
+          export PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH="$CHROME"
+          FAKE_CAM="/tmp/qr-fake-camera.y4m"
+          [ ! -f "$FAKE_CAM" ] && "$SCRIPT_DIR/bin/ffmpeg" -y -f lavfi -i "color=c=gray:s=720x720:r=30" -t 120 -pix_fmt yuv420p "$FAKE_CAM" 2>/dev/null
+          chmod +x "$SCRIPT_DIR/qr-tunnel"
+          echo "Starting bridge..."
+          cd "$SCRIPT_DIR/scripts"
+          node bridge.js --role caller --target "$TARGET_USER" --ws-port 9000 --profile "$SCRIPT_DIR/bale-profile" &
+          BRIDGE_PID=$!
+          cd "$SCRIPT_DIR"
+          sleep 70
+          echo "Starting tunnel..."
+          "$SCRIPT_DIR/qr-tunnel" bale-client --bridge ws://localhost:9000 --socks5 :1080 --http :8080 &
+          TUNNEL_PID=$!
+          trap 'kill $TUNNEL_PID $BRIDGE_PID 2>/dev/null; wait 2>/dev/null' EXIT INT TERM
+          echo "READY — SOCKS5: 127.0.0.1:1080 | HTTP: 127.0.0.1:8080"
+          wait
+          STARTEOF
+          chmod +x $BUNDLE/start.sh
+          # Create empty bale-profile placeholder
+          mkdir -p $BUNDLE/bale-profile
+
+      - name: Build Windows bundle
+        run: |
+          BUNDLE=dist/qr-tunnel-bundle-windows-amd64
+          mkdir -p $BUNDLE/{scripts,node,bin}
+
+          cp dist/qr-tunnel-windows-amd64/qr-tunnel.exe $BUNDLE/
+          cp bale-integration/bridge.js $BUNDLE/scripts/
+          cp bale-integration/package.json $BUNDLE/scripts/
+          cp bale-integration/lk-protocol-bundle.js $BUNDLE/scripts/
+          cd $BUNDLE/scripts && npm install --production 2>&1 | tail -1
+          cd $GITHUB_WORKSPACE
+
+          # Node.js for Windows
+          curl -sL "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip" -o /tmp/node-win.zip
+          cd /tmp && unzip -qo node-win.zip && cp -r node-v22.14.0-win-x64/* $GITHUB_WORKSPACE/$BUNDLE/node/
+          cd $GITHUB_WORKSPACE
+          rm -rf $BUNDLE/node/{node_modules,npm*,npx*,corepack*}
+
+          # ffmpeg for Windows
+          curl -sL "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -o /tmp/ffmpeg-win.zip
+          cd /tmp && unzip -qo ffmpeg-win.zip && cp ffmpeg-*-essentials_build/bin/ffmpeg.exe $GITHUB_WORKSPACE/$BUNDLE/bin/
+          cd $GITHUB_WORKSPACE
+
+          mkdir -p $BUNDLE/bale-profile
+
+      - name: Package archives
+        run: |
+          cd dist
+
+          # Binary-only archives
+          for dir in qr-tunnel-darwin-* qr-tunnel-linux-*; do
+            [ -d "$dir" ] && tar czf "${dir}.tar.gz" "$dir" && rm -rf "$dir"
+          done
+          for dir in qr-tunnel-windows-*; do
+            [ -d "$dir" ] && (cd "$dir" && zip -r "../${dir}.zip" . && cd ..) && rm -rf "$dir"
+          done
+
+          # Bundle archives
+          tar cJf qr-tunnel-bundle-linux-amd64.tar.xz qr-tunnel-bundle-linux-amd64/ && rm -rf qr-tunnel-bundle-linux-amd64/
+          (cd qr-tunnel-bundle-windows-amd64 && zip -r ../qr-tunnel-bundle-windows-amd64.zip . && cd ..) && rm -rf qr-tunnel-bundle-windows-amd64/
+
+          ls -lh
 
       - name: Generate checksums
         run: |
@@ -71,15 +153,10 @@ jobs:
           sha256sum * > checksums.txt
           cat checksums.txt
 
-      - name: Create git tag
-        run: |
-          git tag "${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
-
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: ${{ inputs.version }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
           generate_release_notes: true
           files: dist/*
