@@ -54,18 +54,35 @@ if (!fs.existsSync(fakeCam)) {
 }
 
 // === Bale Health Checker ===
+// Monitors web.bale.ai with exponential backoff.
+// More aggressive during Iran business hours (7AM-6PM Tehran = UTC+3:30).
+// Only kills session after 1+ minute of continuous unavailability.
 class BaleHealthChecker {
   constructor() {
     this.healthy = false;
     this.consecutiveFailures = 0;
     this.consecutiveSuccesses = 0;
-    this.checkInterval = 15000; // start at 15s
-    this.minInterval = 15000;
-    this.maxInterval = 300000; // 5 min max backoff
+    this.checkInterval = 15000;
     this.timer = null;
-    this.onHealthChange = null; // callback(healthy: boolean)
+    this.onHealthChange = null;
     this.lastCheck = null;
+    this.firstFailTime = null; // timestamp of first failure in current streak
     this.totalChecks = 0;
+  }
+
+  // Tehran is UTC+3:30
+  _isTehranBusinessHours() {
+    const now = new Date();
+    const tehranHour = (now.getUTCHours() + 3 + (now.getUTCMinutes() + 30 >= 60 ? 1 : 0)) % 24;
+    return tehranHour >= 7 && tehranHour < 18;
+  }
+
+  _getMaxInterval() {
+    return this._isTehranBusinessHours() ? 120000 : 600000; // 2min biz hours, 10min off hours
+  }
+
+  _getMinInterval() {
+    return this._isTehranBusinessHours() ? 15000 : 30000; // 15s biz, 30s off
   }
 
   async check() {
@@ -75,7 +92,7 @@ class BaleHealthChecker {
         timeout: 10000,
         headers: { 'User-Agent': 'Mozilla/5.0 QRTunnel/1.0' },
       }, (res) => {
-        res.resume(); // drain response
+        res.resume();
         resolve(res.statusCode >= 200 && res.statusCode < 400);
       });
       req.on('error', () => resolve(false));
@@ -84,18 +101,12 @@ class BaleHealthChecker {
   }
 
   async start() {
-    if (healthCheckDisabled) {
-      this.healthy = true;
-      return;
-    }
-    // Initial check
+    if (healthCheckDisabled) { this.healthy = true; return; }
     await this._doCheck();
     this._schedule();
   }
 
-  stop() {
-    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
-  }
+  stop() { if (this.timer) { clearTimeout(this.timer); this.timer = null; } }
 
   _schedule() {
     this.timer = setTimeout(async () => {
@@ -109,36 +120,43 @@ class BaleHealthChecker {
     const ok = await this.check();
     this.lastCheck = new Date();
     const wasHealthy = this.healthy;
+    const bizHours = this._isTehranBusinessHours();
+    const tag = bizHours ? '☀' : '🌙';
 
     if (ok) {
       this.consecutiveFailures = 0;
       this.consecutiveSuccesses++;
+      this.firstFailTime = null;
       this.healthy = true;
-      // Reset interval on success
-      this.checkInterval = this.minInterval;
+      this.checkInterval = this._getMinInterval();
 
-      if (!wasHealthy && this.consecutiveSuccesses >= 1) {
-        const ts = this.lastCheck.toLocaleTimeString();
-        console.log(C.green(`  [health] ✓ Bale is UP (${ts})`));
+      if (!wasHealthy) {
+        console.log(C.green(`  [health] ${tag} ✓ Bale is UP (${this.lastCheck.toLocaleTimeString()})`));
         if (this.onHealthChange) this.onHealthChange(true);
       }
     } else {
       this.consecutiveSuccesses = 0;
       this.consecutiveFailures++;
+      if (!this.firstFailTime) this.firstFailTime = Date.now();
+      const downDuration = Date.now() - this.firstFailTime;
+      const downSec = Math.round(downDuration / 1000);
 
-      // Exponential backoff: 15s → 30s → 60s → 120s → 300s
-      this.checkInterval = Math.min(this.checkInterval * 2, this.maxInterval);
+      // Exponential backoff capped by time-of-day max
+      this.checkInterval = Math.min(this.checkInterval * 2, this._getMaxInterval());
       const nextSec = Math.round(this.checkInterval / 1000);
       const ts = this.lastCheck.toLocaleTimeString();
 
-      if (this.consecutiveFailures === 1) {
-        console.log(C.yellow(`  [health] ✗ Bale unreachable (${ts}) — retrying in ${nextSec}s`));
-      } else if (this.consecutiveFailures === 3) {
-        console.log(C.red(`  [health] ✗✗✗ Bale DOWN — 3 consecutive failures (${ts})`));
+      if (this.consecutiveFailures <= 2) {
+        console.log(C.yellow(`  [health] ${tag} ✗ Bale unreachable (${ts}) — retry in ${nextSec}s`));
+      } else {
+        console.log(C.dim(`  [health] ${tag} ✗ fail #${this.consecutiveFailures} (down ${downSec}s) — retry in ${nextSec}s`));
+      }
+
+      // Only declare unhealthy after 60+ seconds of continuous failure
+      if (downDuration >= 60000 && wasHealthy) {
+        console.log(C.red(`  [health] ✗✗✗ Bale DOWN for ${downSec}s — killing session`));
         this.healthy = false;
         if (this.onHealthChange) this.onHealthChange(false);
-      } else {
-        console.log(C.dim(`  [health] ✗ fail #${this.consecutiveFailures} — next check in ${nextSec}s`));
       }
     }
   }
