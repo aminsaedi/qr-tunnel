@@ -1,89 +1,80 @@
 # qr-tunnel
 
-TCP tunnel over video calls using animated QR codes.
-
-A single Go binary that encodes outbound TCP data as QR code frames, sends them over a WebRTC video call, and decodes them on the other side. Apps connect via a local SOCKS5 proxy. LT fountain codes provide resilience against frame loss.
+TCP tunnel through video calls. Tunnels internet traffic through Bale messenger video calls using LiveKit DataChannels, enabling access to restricted services like Telegram.
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                     qr-tunnel binary                     │
-│                                                          │
-│  App ──► SOCKS5 ──► Transport ──► QR Encoder ──► WebRTC  │
-│               (:1080)    (mux+reliable)    (LT codes)    │
-│                                                          │
-│  Remote TCP ◄── Transport ◄── QR Decoder ◄── WebRTC     │
-│                                                          │
-│  ┌─────────┐  ┌───────────────────┐                      │
-│  │   TUI   │  │ Web UI (optional) │                      │
-│  └─────────┘  └───────────────────┘                      │
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Your App (Telegram, Browser, etc.)                          │
+│       ↓                                                      │
+│  SOCKS5 Proxy (:1080) / HTTP Proxy (:8080)                  │
+│       ↓                                                      │
+│  Transport Layer (multiplexed streams, SYN/ACK/FIN)          │
+│       ↓                                                      │
+│  DataChannel Transport (LiveKit protobuf over WebRTC)        │
+│       ↓                                                      │
+│  Bale Video Call (via Playwright browser automation)          │
+│       ↓  ↑                                                   │
+│  LiveKit SFU (meet-em.ble.ir) relays DataChannel messages    │
+│       ↓  ↑                                                   │
+│  Server Side (exit node — dials real internet destinations)   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Features
+## How It Works
 
-- **Pure Go** — no CGo, no C toolchain. Cross-compiles from anywhere.
-- **LT fountain codes** — reconstructs data from any sufficient subset of frames. Handles 30%+ frame loss.
-- **SOCKS5 proxy** — any app that speaks SOCKS5 can tunnel through a video call.
-- **Multiplexed streams** — multiple TCP connections share one QR channel with independent flow control.
-- **TUI dashboard** — real-time metrics: throughput, QR decode rate, RTT, active streams. Interactive parameter tuning.
-- **Web UI + SimLab** — optional browser dashboard with network simulation sliders (frame drop, noise, delay).
-- **Pluggable providers** — `CallProvider` interface abstracts WebRTC. Swap in any video call backend.
+1. Two Playwright-controlled Chrome browsers establish a Bale video call
+2. Data is sent through LiveKit's WebRTC DataChannels (not the video stream)
+3. The LiveKit SFU relays DataChannel messages between call participants
+4. A SOCKS5/HTTP proxy on the client side accepts connections from apps
+5. The server side dials real internet destinations and relays traffic back
+
+**Throughput:** ~10+ KB/s via DataChannel (vs ~250 B/s with the legacy bitmap/VP9 encoding)
 
 ## Quick Start
 
-```bash
-# Clone and build
-git clone https://github.com/aminsaedi/qr-tunnel.git
-cd qr-tunnel
-make build
-
-# Install test-tool dependencies (signaling server)
-cd test-tool && npm install && cd ..
-
-# Run both server and client (starts signaling automatically)
-./start.sh both
-```
-
-The client SOCKS5 proxy listens on `localhost:1080`. Test it:
+### Server Side (the person with unrestricted internet)
 
 ```bash
-curl --socks5 localhost:1080 https://httpbin.org/ip
+# Interactive mode — prompts for each incoming call
+node serve-cli.js
+
+# Auto-answer mode — for background/tmux usage
+node serve-cli.js --auto-answer
+
+# With health checking disabled
+node serve-cli.js --auto-answer --disable-health-check
 ```
 
-## Usage
+The server opens Bale, monitors for incoming video calls, and auto-answers (or prompts). Once connected, it acts as an exit node.
 
-```
-qr-tunnel client  [flags]    Client mode (SOCKS5 proxy + TUI)
-qr-tunnel server  [flags]    Server mode (exit node + TUI)
-qr-tunnel connect [flags]    Debug mode (no TUI, logs to stdout)
-qr-tunnel version            Show version
-```
-
-### Flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--signaling` | `ws://localhost:3000` | Signaling server WebSocket URL |
-| `--role` | `callee` | `caller` or `callee` |
-| `--socks5` | `:1080` | SOCKS5 listen address (client only) |
-| `--gui` | *(disabled)* | Web UI listen address (e.g., `:8080`) |
-| `--fps` | `15` | QR frames per second |
-| `--qr-version` | `25` | QR version 1–40 (higher = more data per frame) |
-| `--ecc` | `M` | Error correction: `L`, `M`, `Q`, `H` |
-| `--chunk-size` | `800` | Bytes per LT block |
-
-### Examples
+### Client Side (the person with restricted internet)
 
 ```bash
-# Server as callee with web dashboard
-qr-tunnel server --signaling ws://signal.example.com --role callee --gui :8080
+# Using the bundle (includes Node.js, ffmpeg, everything)
+./start.sh
 
-# Client as caller with SOCKS5 on custom port
-qr-tunnel client --signaling ws://signal.example.com --role caller --socks5 :9050
-
-# Debug: connect and send test QR frames
-qr-tunnel connect --signaling ws://localhost:3000 --role callee --test-frames --gui :8080
+# Or manually
+cd bale-integration
+node bridge.js --role caller --target <BALE_USER_ID> --ws-port 9000
+# In another terminal:
+./qr-tunnel bale-client --bridge ws://localhost:9000 --socks5 :1080 --http :8080
 ```
+
+Then configure Telegram (or any app): **SOCKS5 proxy → 127.0.0.1:1080**
+
+## Features
+
+- **LiveKit DataChannel transport** — bypasses VP9 video encoding entirely for reliable, fast data transfer
+- **Bitmap fallback** — falls back to encoding data as grayscale blocks in video frames when DataChannel is unavailable
+- **Bale integration** — full browser automation via Playwright (call, answer, video manipulation)
+- **Interactive server CLI** — detects incoming calls, prompts to answer, shows colored status
+- **Health monitoring** — checks Bale availability with exponential backoff, Tehran business hours awareness
+- **Stats dashboard** — live TX/RX stats displayed on the video call canvas
+- **SOCKS5 + HTTP proxy** — any app can tunnel through the video call
+- **Stream multiplexing** — multiple TCP connections share one tunnel with independent flow control
+- **Auto-recovery** — stream reaper, retransmit with caps, session restart on call end
+- **Pure Go binary** — `CGO_ENABLED=0`, cross-compiles everywhere
+- **Self-contained bundles** — distributable packages with Node.js, ffmpeg, Bale profile included
 
 ## Architecture
 
@@ -91,122 +82,85 @@ qr-tunnel connect --signaling ws://localhost:3000 --role callee --test-frames --
 
 | Layer | Package | Purpose |
 |-------|---------|---------|
-| CLI | `cmd/qr-tunnel/` | Subcommands, flag parsing, wiring |
-| SOCKS5 | `internal/socks5/` | SOCKS5 CONNECT, maps connections to transport streams |
-| Transport | `internal/transport/` | Reliable multiplexed streams (SYN/ACK/FIN, sliding window, retransmit) |
-| QR Codec | `internal/qr/` | LT fountain codes + QR encode/decode |
-| Provider | `internal/provider/` | `CallProvider` interface + pion/webrtc implementation |
-| TUI | `internal/tui/` | bubbletea real-time dashboard |
-| Web UI | `internal/webui/` | Embedded HTTP dashboard + SimLab controls |
+| CLI | `cmd/qr-tunnel/` | `bale-client`, `bale-server`, `client`, `server`, `connect` |
+| Server CLI | `serve-cli.js` | Interactive call management, health checking |
+| HTTP Proxy | `internal/httpproxy/` | HTTP CONNECT proxy for Telegram |
+| SOCKS5 | `internal/socks5/` | SOCKS5 proxy, IPv6 filtering, stream limiting |
+| Transport | `internal/transport/` | Reliable multiplexed streams, retransmit, flow control, stream reaper |
+| Bitmap Codec | `internal/bitmap/` | Grayscale block encoder/decoder (fallback mode) |
+| Bale Provider | `internal/provider/bale/` | WebSocket bridge to Playwright, DataChannel support |
+| WebRTC Provider | `internal/provider/webrtc/` | Direct pion/webrtc (for local testing) |
+| Bridge | `bale-integration/bridge.js` | Playwright browser automation, DataChannel forwarding |
 
-### CallProvider Interface
-
-```go
-type CallProvider interface {
-    Connect(signalingURL string, opts CallOptions) error
-    SendFrame(frame *Frame) error      // Send an RGBA image frame
-    OnFrame(cb func(*Frame))           // Receive RGBA image frames
-    OnState(cb func(State))            // Connection state changes
-    Close() error
-}
-```
-
-No code outside `internal/provider/` imports pion/webrtc. Future video call backends (Bale, etc.) implement this interface.
-
-### Data Flow
+### DataChannel Transport (Primary)
 
 ```
-TCP data
-  → split into chunks
-  → LT fountain encode (robust soliton distribution)
-  → serialize with 20-byte header (magic, session, seq, LT params)
-  → base64 encode
-  → render as QR code image (720x720)
-  → JPEG compress
-  → send over WebRTC DataChannel
-  → receive and JPEG decode
-  → scan QR code (gozxing with Otsu binarization)
-  → base64 decode
-  → parse header, feed LT block to decoder
-  → when k+ blocks received: reconstruct original data
-  → deliver to transport stream
+Go binary → WebSocket (0xDC prefix) → bridge.js
+  → LiveKit DataPacket protobuf → _reliable DataChannel
+  → LiveKit SFU relays → remote _reliable DataChannel
+  → bridge.js extracts payload → WebSocket (0xDC prefix) → Go binary
 ```
+
+The `@livekit/protocol` SDK is bundled and injected into the browser page for correct protobuf serialization. The SFU relays `DataPacket` messages between participants.
+
+### Bitmap Transport (Fallback)
+
+```
+Go binary → bitmap encoder (16×16 grayscale blocks, 720×720)
+  → JPEG → WebSocket → bridge.js draws to canvas
+  → VP9 encode → Bale SFU → VP9 decode
+  → bridge.js captures canvas → JPEG → WebSocket → Go bitmap decoder
+```
+
+Used when DataChannel is not available. ~250 B/s throughput, 17% frame survival through VP9.
 
 ## Building
 
 ```bash
-make build          # Build for current platform
-make build-all      # Cross-compile all 5 targets
-make clean          # Remove build artifacts
+CGO_ENABLED=0 go build -o qr-tunnel ./cmd/qr-tunnel          # Current platform
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o qr-tunnel  # Linux
+make build-all                                                  # All platforms
 ```
 
-Cross-compilation targets:
-- `darwin/amd64`, `darwin/arm64`
-- `linux/amd64`, `linux/arm64`
-- `windows/amd64`
+## Health Monitoring
 
-All builds use `CGO_ENABLED=0` — no C compiler needed.
+The server CLI includes a Bale health checker:
 
-## Testing
+- Checks `web.bale.ai` availability periodically
+- **Exponential backoff**: 15s → 30s → 60s → 120s → up to 10 min
+- **Tehran business hours** (7AM-6PM UTC+3:30): more aggressive checking
+- Kills session after **60+ seconds** of continuous unavailability
+- Auto-restarts when Bale comes back online
 
-### Unit Tests
+## Client Bundles
 
-```bash
-make test                                                    # All tests with -race
-go test ./internal/qr/ -v -run TestLTCodesRoundTrip          # Single test
-go test ./internal/qr/ -v -run TestEncoderDecoderWithFrameLoss  # QR round-trip with 30% loss
-```
+Self-contained packages for distribution (no installs needed except Chrome):
 
-### E2E Tests (Playwright)
+| Bundle | Contents | Size |
+|--------|----------|------|
+| Full (Linux) | qr-tunnel + Node.js + ffmpeg + Playwright deps + Bale profile | ~56 MB (xz) |
+| Full (Windows) | qr-tunnel.exe + node.exe + ffmpeg.exe + deps + Bale profile | ~77 MB (zip) |
 
-```bash
-cd tests && npm install
-npx playwright install chromium    # First time only
-npx playwright test                # Run all 13 E2E tests
-npx playwright test e2e-call.spec.js   # Single suite
-```
+Generate bundles: see the bundle creation scripts in the project history.
 
-E2E tests cover:
-- **Call establishment** — Go binary ↔ browser WebRTC, signaling relay
-- **QR frame exchange** — Go→browser and browser→Go frame transfer at 14fps
-- **Tunnel connectivity** — Two Go binaries connect, Web UI serves dashboard + SimLab API
-- **Degradation** — QR codec with frame loss, LT codes stress test, cross-compilation verification
+## Configuration
 
-### Test Tool (Signaling Server)
+### Server flags (`serve-cli.js`)
 
-```bash
-cd test-tool && npm install
-node server.js                     # Runs on :3000
-PORT=4000 node server.js           # Custom port
-```
+| Flag | Description |
+|------|-------------|
+| `--auto-answer` / `-a` | Answer calls automatically |
+| `--disable-health-check` | Skip Bale availability monitoring |
 
-Minimal WebSocket relay for exactly 2 peers. Used by both E2E tests and development.
+### Client flags (`qr-tunnel bale-client`)
 
-## Web UI
-
-Start with `--gui :8080`:
-
-- **Dashboard** (`/`) — live metrics: throughput, QR FPS, decode rate, RTT, active streams
-- **SimLab** (`/simlab`) — network simulation sliders:
-  - Frame drop rate (0–80%)
-  - Pixel noise (0–50%)
-  - Decode delay (0–500ms)
-  - QR version, FPS, chunk size
-
-API endpoints:
-- `GET /api/metrics` — JSON metrics snapshot
-- `GET/POST /api/sim` — read/write simulation parameters
-
-## TUI Controls
-
-| Key | Action |
-|-----|--------|
-| `Tab` | Toggle parameter editing mode |
-| `↑/↓` | Select parameter |
-| `←/→` | Adjust value |
-| `q` | Quit |
-
-Parameters adjustable at runtime: QR version, ECC level, FPS, chunk size, simulated drop/noise/delay.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bridge` | `ws://localhost:9000` | Bridge WebSocket URL |
+| `--socks5` | `:1080` | SOCKS5 proxy listen address |
+| `--http` | `:8080` | HTTP CONNECT proxy address |
+| `--block-size` | `16` | Bitmap block size (fallback mode) |
+| `--bits-per-block` | `1` | Bits per block (fallback mode) |
 
 ## License
 

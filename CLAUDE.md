@@ -4,86 +4,103 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-**qr-tunnel** — a Go binary that tunnels TCP traffic through video calls by encoding data as animated QR codes. It uses LT fountain codes for loss resilience and exposes a SOCKS5 proxy for apps to connect through.
+**qr-tunnel** — tunnels TCP traffic through Bale messenger video calls using LiveKit WebRTC DataChannels. Provides SOCKS5/HTTP proxy for apps like Telegram to access restricted internet.
 
 Module: `github.com/aminsaedi/qr-tunnel`
 
 ## Build & Test Commands
 
 ```bash
-make build              # Build binary for current platform
-make build-all          # Cross-compile: macOS/Linux/Windows × amd64/arm64
-make test               # Go unit tests with -race (go test ./internal/... -v -race -timeout 120s)
-make test-e2e           # Playwright E2E tests (needs Chromium)
-make lint               # golangci-lint or go vet fallback
+CGO_ENABLED=0 go build -o qr-tunnel ./cmd/qr-tunnel   # Build binary
+go test ./internal/bitmap/ -v -race -timeout 60s        # Bitmap codec tests
+go test ./internal/bitmap/ -v -run TestBitmapSurvivesVP9 # VP9 survival tests
 
-# Run a single Go test:
-go test ./internal/qr/ -v -run TestLTCodesRoundTrip -timeout 60s
+# Server (your side — answers calls, provides internet)
+node serve-cli.js --auto-answer
 
-# Run a single Playwright test:
-cd tests && npx playwright test e2e-call.spec.js
-
-# Quick dev start (starts signaling + server + client):
-./start.sh both
+# Client (friend's side — initiates call, gets proxy)
+cd bale-integration && node bridge.js --role caller --target 884923192 --ws-port 9000
+./qr-tunnel bale-client --bridge ws://localhost:9000 --socks5 :1080 --http :8080
 ```
 
 ## Critical Constraint: Pure Go, No CGo
 
-Every dependency must be pure Go. The binary must build with `CGO_ENABLED=0`. No C toolchain, no libvpx, no OpenCV. This is why video frames are sent as JPEG over WebRTC DataChannels instead of VP8 media tracks (no pure-Go VP8 encoder exists).
-
-Verify with: `CGO_ENABLED=0 go build ./cmd/qr-tunnel`
+Every Go dependency must be pure Go. `CGO_ENABLED=0 go build ./cmd/qr-tunnel` must work.
 
 ## Architecture
 
+### Two Transport Modes
+
+**DataChannel (primary, ~10+ KB/s):** Data goes through LiveKit's WebRTC DataChannel, bypassing video encoding entirely. Uses `@livekit/protocol` SDK for correct DataPacket protobuf serialization. The SFU relays messages between participants.
+
+**Bitmap (fallback, ~250 B/s):** Encodes data as 16×16 grayscale blocks in 720×720 video frames. Survives VP9 compression with ~17% decode rate. Used when DataChannel is not available.
+
+### Data Flow (DataChannel mode)
+
 ```
-App → SOCKS5 (:1080) → Transport (mux + reliable) → QR Encoder → WebRTC DataChannel
-                                                                        ↕ (signaling server)
-Remote TCP ← Transport ← QR Decoder ← WebRTC DataChannel
-```
-
-**Data path:** Binary data → LT fountain code blocks → base64 → QR code image frames → JPEG over DataChannel → decode QR → LT reassemble → binary data.
-
-### Key Abstraction: `CallProvider` interface (`internal/provider/provider.go`)
-
-```go
-type CallProvider interface {
-    Connect(signalingURL string, opts CallOptions) error
-    SendFrame(frame *Frame) error
-    OnFrame(cb func(*Frame))
-    OnState(cb func(State))
-    Close() error
-}
+App → SOCKS5 (:1080) → Transport (mux streams) → BaleProvider.SendData()
+  → WebSocket (0xDC prefix) → bridge.js → LiveKit DataPacket protobuf
+  → _reliable DataChannel → SFU relays → remote DataChannel
+  → bridge.js extracts payload → WebSocket → BaleProvider.OnData()
+  → Transport → SOCKS5 server → real internet
 ```
 
-All code outside `internal/provider/` talks to this interface — never to pion/webrtc directly. The current implementation uses pion DataChannels with JPEG-encoded frames. Future messenger integrations (Bale, etc.) implement this same interface.
+### Key Abstractions
+
+**`CallProvider` interface** (`internal/provider/provider.go`): All transport code talks to this. WebRTC and Bale providers implement it.
+
+**`DataChannelProvider` interface** (`internal/transport/transport.go`): Optional extension for providers that support direct binary transport (bypasses bitmap encode/decode).
+
+**`BaleProvider`** (`internal/provider/bale/provider.go`): WebSocket bridge to Playwright browser. Supports both JPEG frame exchange (bitmap mode) and raw DataChannel forwarding (DC mode). Uses `0xDC` prefix byte to distinguish DC messages from legacy JPEG frames.
 
 ### Layer Stack
 
 | Layer | Package | Role |
 |---|---|---|
-| CLI | `cmd/qr-tunnel/` | Subcommands: `client`, `server`, `connect` |
-| SOCKS5 | `internal/socks5/` | Accepts CONNECT, maps to transport streams |
-| Transport | `internal/transport/` | Reliable multiplexed streams (SYN/ACK/FIN, sliding window, retransmit) |
-| QR Codec | `internal/qr/` | LT fountain codes + QR encode/decode with gozxing |
-| Provider | `internal/provider/webrtc/` | pion/webrtc DataChannel, signaling via WebSocket |
-| TUI | `internal/tui/` | bubbletea real-time dashboard |
-| Web UI | `internal/webui/` | Embedded HTTP dashboard + SimLab API (`//go:embed`) |
+| CLI | `cmd/qr-tunnel/` | `bale-client`, `bale-server`, `client`, `server` |
+| Server CLI | `serve-cli.js` | Interactive call management, health checking |
+| HTTP Proxy | `internal/httpproxy/` | HTTP CONNECT, IPv6 filtering, stream limiting |
+| SOCKS5 | `internal/socks5/` | SOCKS5 CONNECT, IPv6 filtering |
+| Transport | `internal/transport/` | Multiplexed reliable streams, cumulative ACK, retransmit with caps, stream reaper |
+| Bitmap | `internal/bitmap/` | Grayscale block encode/decode, VP9 survival |
+| Bale Provider | `internal/provider/bale/` | WS bridge, DC mode detection |
+| Bridge | `bale-integration/bridge.js` | Playwright automation, DC forwarding, stats dashboard, call detection |
 
-### Signaling Race Condition (already fixed, but know this)
+### Bridge (bridge.js) Key Details
 
-The `OnMessage` handler must be registered BEFORE `signaling.Connect()` because the `welcome` message arrives almost instantly on localhost. The PeerConnection and DataChannel are also created before connecting to signaling.
+- **INIT_SCRIPT**: Injected before page load. Hooks `RTCPeerConnection` to capture DataChannels, overrides `getUserMedia` for canvas transform pipeline, adds stats renderer.
+- **LiveKit protocol**: `lk-protocol-bundle.js` (esbuild bundle of `@livekit/protocol`) injected via `addInitScript` for DataPacket encoding/decoding.
+- **DataChannel forwarding**: Sends on publisher's `_reliable` DC, receives on subscriber's `_reliable` DC. Messages wrapped as `DataPacket { user: UserPacket { payload } }`.
+- **Call automation**: `findAndClick()` uses TreeWalker text matching + mouse.click. Callee detects "Answer" text, clicks it and "Answer Call". Falls back to interactive prompt if auto-click fails.
+- **Stats dashboard**: `__drawTunnelStats()` renders TX/RX data, speed, mode on the canvas that replaces the camera feed.
 
-## QR Payload Format
+### Transport Layer Details
 
-Binary payload is base64-encoded before embedding in QR. Header (20 bytes):
-`[1B magic=0xAA][1B ver][4B session_id][4B seq][2B total_blocks][2B lt_index][4B lt_seed][2B payload_len]`
+- **Cumulative ACK**: ACKs report `recvNext - 1` (in-order frontier), not raw received seq
+- **Retransmit cap**: Max 30 retries per frame, then drop (prevents stale retransmit flooding)
+- **Stream reaper**: Closes streams idle >90s or older than 5 min (prevents zombie accumulation when FINs are lost)
+- **Non-blocking Write**: If sendQueue is full, frame stays in sendBuf for retransmit instead of blocking
+- **SYN retransmit**: Single retry at 3-4 seconds after creation
+- **DC mode**: 5ms tick, 64KB batch size (vs 100ms tick, ~221 byte bitmap payload)
 
-## E2E Test Ports
+### Health Checker (serve-cli.js)
 
-Tests use ports 4001–4007 (not 3000) to avoid conflicts with development. Tests run serially (1 worker) because each test spawns its own signaling server and Go binary processes. The `helpers.js` manages process lifecycle with detached process groups.
+- Monitors `https://web.bale.ai/` with HTTPS GET
+- Exponential backoff: 15s → 30s → 60s → 120s → max (2 min biz, 10 min off-hours)
+- Tehran business hours (7AM-6PM UTC+3:30): more aggressive checking
+- Kills session after 60+ seconds of continuous failure
+- Auto-recovers when Bale comes back
+
+## Bale Account Profiles
+
+- `bale-analysis/profile-a/` — Hossein's account (caller/client)
+- `bale-analysis/profile-b/` — Amin's account (callee/server)
+- `bale-analysis/profile-bahram/` — Bahram's account (Windows client)
+- Tokens valid ~1 year (cookie-based, Chromium encrypted per-machine)
 
 ## CLI Modes
 
-- `client` — SOCKS5 proxy + TUI + optional web UI. Connects as caller or callee.
-- `server` — Exit node + TUI. Accepts transport streams and dials real TCP destinations.
-- `connect` — Minimal debug mode (no TUI, no SOCKS5). Useful for testing WebRTC connectivity. Supports `--test-frames` to send QR patterns and `--gui` for web dashboard.
+- `bale-client` — SOCKS5 + HTTP proxy via Bale call. Default: 16×16 blocks, 1-bit, DataChannel enabled
+- `bale-server` — Exit node via Bale call. Accepts streams, dials real destinations
+- `client` / `server` — Direct WebRTC mode (for local testing without Bale)
+- `connect` — Debug mode with optional `--test-frames` and `--gui`
