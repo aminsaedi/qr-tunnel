@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 // QR Tunnel Server CLI — monitors Bale for incoming calls with interactive control
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
+const https = require('https');
 const readline = require('readline');
 const path = require('path');
 const fs = require('fs');
 
 const autoAnswer = process.argv.includes('--auto-answer') || process.argv.includes('-a');
+const healthCheckDisabled = process.argv.includes('--disable-health-check');
 const projectDir = path.resolve(__dirname);
 const profileDir = path.join(projectDir, 'bale-analysis', 'profile-b');
 const bridgeScript = path.join(projectDir, 'bale-integration', 'bridge.js');
@@ -30,6 +32,9 @@ console.log('');
 console.log(autoAnswer
   ? C.green('  Mode: AUTO-ANSWER — calls answered automatically')
   : C.yellow('  Mode: INTERACTIVE — you approve each call'));
+console.log(healthCheckDisabled
+  ? C.dim('  Health check: disabled')
+  : C.green('  Health check: enabled (monitoring web.bale.ai)'));
 console.log('');
 
 // Ensure prerequisites
@@ -48,14 +53,114 @@ if (!fs.existsSync(fakeCam)) {
   } catch {}
 }
 
+// === Bale Health Checker ===
+class BaleHealthChecker {
+  constructor() {
+    this.healthy = false;
+    this.consecutiveFailures = 0;
+    this.consecutiveSuccesses = 0;
+    this.checkInterval = 15000; // start at 15s
+    this.minInterval = 15000;
+    this.maxInterval = 300000; // 5 min max backoff
+    this.timer = null;
+    this.onHealthChange = null; // callback(healthy: boolean)
+    this.lastCheck = null;
+    this.totalChecks = 0;
+  }
+
+  async check() {
+    this.totalChecks++;
+    return new Promise((resolve) => {
+      const req = https.get('https://web.bale.ai/', {
+        timeout: 10000,
+        headers: { 'User-Agent': 'Mozilla/5.0 QRTunnel/1.0' },
+      }, (res) => {
+        res.resume(); // drain response
+        resolve(res.statusCode >= 200 && res.statusCode < 400);
+      });
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+    });
+  }
+
+  async start() {
+    if (healthCheckDisabled) {
+      this.healthy = true;
+      return;
+    }
+    // Initial check
+    await this._doCheck();
+    this._schedule();
+  }
+
+  stop() {
+    if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+  }
+
+  _schedule() {
+    this.timer = setTimeout(async () => {
+      if (stopping) return;
+      await this._doCheck();
+      this._schedule();
+    }, this.checkInterval);
+  }
+
+  async _doCheck() {
+    const ok = await this.check();
+    this.lastCheck = new Date();
+    const wasHealthy = this.healthy;
+
+    if (ok) {
+      this.consecutiveFailures = 0;
+      this.consecutiveSuccesses++;
+      this.healthy = true;
+      // Reset interval on success
+      this.checkInterval = this.minInterval;
+
+      if (!wasHealthy && this.consecutiveSuccesses >= 1) {
+        const ts = this.lastCheck.toLocaleTimeString();
+        console.log(C.green(`  [health] ✓ Bale is UP (${ts})`));
+        if (this.onHealthChange) this.onHealthChange(true);
+      }
+    } else {
+      this.consecutiveSuccesses = 0;
+      this.consecutiveFailures++;
+
+      // Exponential backoff: 15s → 30s → 60s → 120s → 300s
+      this.checkInterval = Math.min(this.checkInterval * 2, this.maxInterval);
+      const nextSec = Math.round(this.checkInterval / 1000);
+      const ts = this.lastCheck.toLocaleTimeString();
+
+      if (this.consecutiveFailures === 1) {
+        console.log(C.yellow(`  [health] ✗ Bale unreachable (${ts}) — retrying in ${nextSec}s`));
+      } else if (this.consecutiveFailures === 3) {
+        console.log(C.red(`  [health] ✗✗✗ Bale DOWN — 3 consecutive failures (${ts})`));
+        this.healthy = false;
+        if (this.onHealthChange) this.onHealthChange(false);
+      } else {
+        console.log(C.dim(`  [health] ✗ fail #${this.consecutiveFailures} — next check in ${nextSec}s`));
+      }
+    }
+  }
+}
+
+const healthChecker = new BaleHealthChecker();
+
 let bridgeProc = null;
 let tunnelProc = null;
 let stopping = false;
+let sessionActive = false; // true when bridge+tunnel are running
+
+function killSession() {
+  if (tunnelProc) { try { tunnelProc.kill(); } catch {} tunnelProc = null; }
+  if (bridgeProc) { try { bridgeProc.kill(); } catch {} bridgeProc = null; }
+  sessionActive = false;
+}
 
 function cleanup() {
   stopping = true;
-  if (tunnelProc) { try { tunnelProc.kill(); } catch {} }
-  if (bridgeProc) { try { bridgeProc.kill(); } catch {} }
+  healthChecker.stop();
+  killSession();
 }
 process.on('SIGINT', () => { console.log('\n' + C.cyan('Shutting down...')); cleanup(); setTimeout(() => process.exit(0), 1000); });
 process.on('SIGTERM', () => { cleanup(); process.exit(0); });
@@ -205,10 +310,36 @@ async function runSession() {
   });
 }
 
-// Main loop
+// Main loop with health checking
 (async () => {
+  // Wire up health change callback
+  healthChecker.onHealthChange = (healthy) => {
+    if (!healthy && sessionActive) {
+      console.log(C.red('  [health] Killing session — Bale is down'));
+      killSession();
+    }
+  };
+
+  // Initial health check
+  console.log(C.dim('  Checking Bale availability...'));
+  await healthChecker.start();
+
   while (!stopping) {
+    // Wait for Bale to be healthy before starting a session
+    if (!healthChecker.healthy) {
+      console.log(C.yellow('  Waiting for Bale to come back online...'));
+      while (!healthChecker.healthy && !stopping) {
+        await new Promise(r => setTimeout(r, 5000));
+      }
+      if (stopping) break;
+      console.log(C.green('  Bale is back! Starting session...'));
+      await new Promise(r => setTimeout(r, 2000)); // brief pause
+    }
+
+    sessionActive = true;
     await runSession();
+    sessionActive = false;
+
     if (!stopping) {
       console.log('');
       console.log(C.yellow('  Restarting in 5 seconds... (Ctrl+C to stop)'));
