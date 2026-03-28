@@ -671,9 +671,19 @@ async function askUser(prompt) {
 
 async function doCaller(page) {
   console.log('[bridge] Click video call...');
-  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 5000 }); await b.click(); } catch {}
+  let clicked = false;
+  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 10000 }); await b.click(); clicked = true; } catch {}
+  if (!clicked) {
+    console.log('[bridge] Could not find video call button automatically.');
+    await askUser('Please click the VIDEO CALL button (camera icon, top right)');
+  }
   await sleep(2000);
-  await findAndClick(page, ['Start Call'], 15000);
+
+  let started = await findAndClick(page, ['Start Call'], 20000);
+  if (!started) {
+    console.log('[bridge] Could not find Start Call button automatically.');
+    await askUser('Please click START CALL in the dialog');
+  }
   await sleep(3000);
   await waitForCall(page);
 }
