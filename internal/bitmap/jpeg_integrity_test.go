@@ -33,7 +33,7 @@ func TestJPEGDoubleCompression(t *testing.T) {
 				pass, fail := 0, 0
 				for trial := 0; trial < 30; trial++ {
 					payload := make([]byte, size)
-					rand.Read(payload)
+					rand.Read(payload) //nolint:errcheck
 
 					img := enc.EncodePacket(uint16(trial+1), payload)
 

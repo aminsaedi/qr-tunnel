@@ -49,7 +49,7 @@ func TestFullPipelineSurvival(t *testing.T) {
 			pass, fail := 0, 0
 			for trial := 0; trial < 10; trial++ {
 				payload := make([]byte, tt.size)
-				rand.Read(payload)
+				rand.Read(payload) //nolint:errcheck
 
 				img := enc.EncodePacket(uint16(trial+1), payload)
 

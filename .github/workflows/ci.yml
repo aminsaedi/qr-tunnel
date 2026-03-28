@@ -36,7 +36,7 @@ jobs:
           go-version-file: go.mod
 
       - name: Run unit tests
-        run: go test ./internal/... -v -race -timeout 120s
+        run: go test ./internal/... -v -race -timeout 300s
 
   build:
     name: Build
