@@ -95,6 +95,14 @@ async function forwardToDC(payload) {
     }, b64);
     if (sent) {
       dcTxCount++;
+      // Update page stats
+      await page.evaluate((len) => {
+        const s = window.__tunnelStats;
+        s.txBytes += len; s.txPkts++;
+        s.connected = true; s.mode = 'datachannel';
+        if (!s.startTime) s.startTime = Date.now();
+        s.lastActivity = Date.now();
+      }, payload.length).catch(() => {});
       if (dcTxCount % 100 === 1) console.log(`[DC-tx] #${dcTxCount} via ${sent} (${payload.length} bytes)`);
     } else {
       if (dcTxCount === 0) console.log('[DC-tx] no DC available, dropping');
@@ -238,6 +246,120 @@ const INIT_SCRIPT = `
     }
     return null;
   };
+  // === Tunnel Stats ===
+  window.__tunnelStats = {
+    txBytes: 0, rxBytes: 0, txPkts: 0, rxPkts: 0,
+    startTime: 0, connected: false, mode: 'waiting',
+    streams: 0, lastActivity: 0,
+  };
+
+  // Stats dashboard renderer — shown on the fake camera video
+  window.__drawTunnelStats = function(ctx, videoOrFrame) {
+    const W = 720, H = 720;
+    const s = window.__tunnelStats;
+    const now = Date.now();
+
+    // Dark background
+    ctx.fillStyle = '#1a1a2e';
+    ctx.fillRect(0, 0, W, H);
+
+    // Animated gradient accent bar at top
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, '#0f3460');
+    grad.addColorStop(0.5, s.connected ? '#16c784' : '#e94560');
+    grad.addColorStop(1, '#0f3460');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, 6);
+
+    ctx.textAlign = 'center';
+
+    // Title
+    ctx.fillStyle = '#e6e6e6';
+    ctx.font = 'bold 36px monospace';
+    ctx.fillText('QR TUNNEL', W/2, 60);
+
+    // Status
+    ctx.font = 'bold 24px monospace';
+    if (s.connected) {
+      ctx.fillStyle = '#16c784';
+      ctx.fillText('CONNECTED', W/2, 100);
+      ctx.fillStyle = '#8892b0';
+      ctx.font = '16px monospace';
+      const uptime = Math.floor((now - s.startTime) / 1000);
+      const m = Math.floor(uptime / 60);
+      const sec = uptime % 60;
+      ctx.fillText('Uptime: ' + m + 'm ' + sec + 's', W/2, 125);
+    } else {
+      ctx.fillStyle = '#e94560';
+      ctx.fillText(s.mode === 'datachannel' ? 'DC MODE' : 'WAITING...', W/2, 100);
+    }
+
+    // Stats boxes
+    const boxY = 160;
+    function drawBox(x, y, w, h, label, value, unit) {
+      ctx.fillStyle = 'rgba(255,255,255,0.06)';
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(x, y, w, h, 8);
+      ctx.fill();
+      ctx.stroke();
+      ctx.fillStyle = '#8892b0';
+      ctx.font = '14px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(label, x + w/2, y + 22);
+      ctx.fillStyle = '#e6e6e6';
+      ctx.font = 'bold 28px monospace';
+      ctx.fillText(value, x + w/2, y + 58);
+      ctx.fillStyle = '#8892b0';
+      ctx.font = '12px monospace';
+      ctx.fillText(unit, x + w/2, y + 78);
+    }
+
+    function fmtBytes(b) {
+      if (b < 1024) return b + ' B';
+      if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
+      return (b/1024/1024).toFixed(1) + ' MB';
+    }
+
+    // Speed calc
+    if (!s._lastCheck) { s._lastCheck = now; s._lastTx = 0; s._lastRx = 0; s._txSpeed = 0; s._rxSpeed = 0; }
+    if (now - s._lastCheck > 1000) {
+      const dt = (now - s._lastCheck) / 1000;
+      s._txSpeed = (s.txBytes - s._lastTx) / dt;
+      s._rxSpeed = (s.rxBytes - s._lastRx) / dt;
+      s._lastCheck = now;
+      s._lastTx = s.txBytes;
+      s._lastRx = s.rxBytes;
+    }
+
+    const bw = 155, bh = 90, gap = 15;
+    const startX = (W - 4*bw - 3*gap) / 2;
+
+    drawBox(startX, boxY, bw, bh, 'TX DATA', fmtBytes(s.txBytes), s.txPkts + ' packets');
+    drawBox(startX+bw+gap, boxY, bw, bh, 'RX DATA', fmtBytes(s.rxBytes), s.rxPkts + ' packets');
+    drawBox(startX+2*(bw+gap), boxY, bw, bh, 'TX SPEED', fmtBytes(Math.round(s._txSpeed||0)) + '/s', '');
+    drawBox(startX+3*(bw+gap), boxY, bw, bh, 'RX SPEED', fmtBytes(Math.round(s._rxSpeed||0)) + '/s', '');
+
+    // Second row
+    const row2Y = boxY + bh + gap;
+    drawBox(startX, row2Y, bw, bh, 'MODE', s.mode === 'datachannel' ? 'DC' : s.mode, s.mode === 'datachannel' ? 'DataChannel' : '');
+    drawBox(startX+bw+gap, row2Y, bw, bh, 'STREAMS', '' + s.streams, 'active');
+
+    // Activity indicator
+    const active = s.lastActivity && (now - s.lastActivity) < 2000;
+    ctx.fillStyle = active ? '#16c784' : '#3a3a5c';
+    ctx.beginPath();
+    ctx.arc(W - 30, 30, 8, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Footer
+    ctx.fillStyle = '#3a3a5c';
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('github.com/aminsaedi/qr-tunnel', W/2, H - 15);
+  };
+
   // Hook RTCDataChannel.send to capture LiveKit's _reliable DC send function
   const _origDCSend = RTCDataChannel.prototype.send;
   window.__lkSendDC = null;
@@ -289,21 +411,8 @@ const INIT_SCRIPT = `
           window.__frameN++;
           const ctx = window.__qrCtx;
 
-          if (window.__goFrame) {
-            // Draw QR code from Go binary
-            ctx.drawImage(window.__goFrame, 0, 0, 720, 720);
-          } else {
-            // Draw the real camera frame with "QR TUNNEL" overlay
-            ctx.drawImage(videoFrame, 0, 0, 720, 720);
-            ctx.fillStyle = 'rgba(255,255,255,0.85)';
-            ctx.fillRect(200, 300, 320, 80);
-            ctx.fillStyle = '#000';
-            ctx.font = 'bold 28px monospace';
-            ctx.textAlign = 'center';
-            ctx.fillText('QR TUNNEL', 360, 340);
-            ctx.font = '16px monospace';
-            ctx.fillText('Waiting...', 360, 365);
-          }
+          // Always draw stats dashboard on the canvas
+          window.__drawTunnelStats(ctx, videoFrame);
 
           // Create new VideoFrame from canvas
           const newFrame = new VideoFrame(window.__qrCanvas, {
@@ -344,19 +453,7 @@ const INIT_SCRIPT = `
       function drawLoop() {
         window.__frameN++;
         const ctx = window.__qrCtx;
-        if (window.__goFrame) {
-          ctx.drawImage(window.__goFrame, 0, 0, 720, 720);
-        } else if (video.readyState >= 2) {
-          ctx.drawImage(video, 0, 0, 720, 720);
-          ctx.fillStyle = 'rgba(255,255,255,0.85)';
-          ctx.fillRect(200, 300, 320, 80);
-          ctx.fillStyle = '#000';
-          ctx.font = 'bold 28px monospace';
-          ctx.textAlign = 'center';
-          ctx.fillText('QR TUNNEL', 360, 340);
-          ctx.font = '16px monospace';
-          ctx.fillText('Waiting...', 360, 365);
-        }
+        window.__drawTunnelStats(ctx, video.readyState >= 2 ? video : null);
         requestAnimationFrame(drawLoop);
       }
       requestAnimationFrame(drawLoop);
@@ -531,10 +628,20 @@ async function main() {
         return msgs;
       });
       if (messages && messages.length > 0) {
+        let batchBytes = 0;
         for (const msg of messages) {
           sendDCToGo(Buffer.from(msg));
           dcRxCount++;
+          batchBytes += msg.length;
         }
+        // Update page stats
+        page.evaluate((bytes, pkts) => {
+          const s = window.__tunnelStats;
+          s.rxBytes += bytes; s.rxPkts += pkts;
+          s.connected = true; s.mode = 'datachannel';
+          if (!s.startTime) s.startTime = Date.now();
+          s.lastActivity = Date.now();
+        }, batchBytes, messages.length).catch(() => {});
         if (dcRxCount % 100 < messages.length) {
           console.log(`[DC-rx] total=${dcRxCount}, batch=${messages.length}`);
         }
