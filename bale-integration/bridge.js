@@ -11,10 +11,11 @@ const targetUser = args.find((_, i, a) => a[i - 1] === '--target') || '884923192
 const wsPort = parseInt(args.find((_, i, a) => a[i - 1] === '--ws-port') || '9000');
 const profileDir = args.find((_, i, a) => a[i - 1] === '--profile') ||
   path.join(__dirname, role === 'caller' ? 'profile-a' : 'profile-b');
+const autoAnswer = args.includes('--auto-answer');
 const FPS = 20; // Higher capture rate for bitmap codec
 const FAKE_CAMERA = '/tmp/qr-fake-camera.y4m';
 
-console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort}`);
+console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort} autoAnswer=${autoAnswer}`);
 
 let goSocket = null, page = null, callActive = false;
 let dcMode = false; // DataChannel transport mode active
@@ -670,12 +671,92 @@ async function doCaller(page) {
 }
 
 async function doCallee(page) {
-  console.log('[bridge] Waiting for call...');
-  await findAndClick(page, ['Answer'], 300000);
-  await sleep(2000);
-  await findAndClick(page, ['Answer Call', 'Start Call'], 15000);
-  await sleep(3000);
+  // Phase 1: Detect incoming call (wait for "Answer" text to appear)
+  console.log('[bridge] Monitoring for incoming calls...');
+
+  // Poll for incoming call notification
+  let callDetected = false;
+  for (let i = 0; i < 6000; i++) { // up to ~50 min
+    const hasCall = await page.evaluate(() => {
+      const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+      while (w.nextNode()) {
+        const t = w.currentNode.textContent.trim();
+        if (t === 'Answer' || t === 'Decline' || t === 'پاسخ' || t === 'رد') return true;
+      }
+      return false;
+    }).catch(() => false);
+
+    if (hasCall) {
+      // Notify via stdout (the CLI script reads this)
+      console.log('[bridge] INCOMING_CALL_DETECTED');
+      callDetected = true;
+      break;
+    }
+    await sleep(500);
+  }
+
+  if (!callDetected) {
+    console.log('[bridge] No call received (timeout)');
+    return;
+  }
+
+  // Phase 2: Answer the call (auto or wait for approval)
+  if (autoAnswer) {
+    console.log('[bridge] Auto-answering...');
+    await answerCall(page);
+  } else {
+    // Wait for ANSWER_NOW command from stdin (the CLI script sends it)
+    console.log('[bridge] WAITING_FOR_APPROVAL');
+    await new Promise(resolve => {
+      const handler = (data) => {
+        const cmd = data.toString().trim();
+        if (cmd === 'ANSWER_NOW') {
+          process.stdin.removeListener('data', handler);
+          resolve();
+        } else if (cmd === 'DECLINE') {
+          process.stdin.removeListener('data', handler);
+          // Just ignore the call — it'll ring out
+          resolve();
+          return;
+        }
+      };
+      process.stdin.on('data', handler);
+      // Auto-answer after 30s if no response (call will drop otherwise)
+      setTimeout(() => { process.stdin.removeListener('data', handler); resolve(); }, 30000);
+    });
+    console.log('[bridge] Answering call...');
+    await answerCall(page);
+  }
+
   await waitForCall(page);
+}
+
+async function answerCall(page) {
+  // Click "Answer" button
+  let answered = await findAndClick(page, ['Answer'], 5000);
+  if (!answered) {
+    console.log('[bridge] ANSWER_FAILED — could not find Answer button');
+    console.log('[bridge] Please answer the call manually in the browser window');
+    // Wait for manual answer (detect video playing)
+    for (let i = 0; i < 30; i++) {
+      const vids = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('video'))
+          .filter(v => !v.paused && v.readyState >= 2 && v.videoWidth > 10).length
+      ).catch(() => 0);
+      if (vids >= 1) break;
+      await sleep(2000);
+    }
+    return;
+  }
+  await sleep(2000);
+
+  // Click confirm ("Answer Call" / "Start Call")
+  let confirmed = await findAndClick(page, ['Answer Call', 'Start Call'], 15000);
+  if (!confirmed) {
+    console.log('[bridge] CONFIRM_FAILED — could not find confirm button');
+    console.log('[bridge] Please confirm the call manually in the browser window');
+  }
+  await sleep(3000);
 }
 
 async function dumpPageState(page, label) {
