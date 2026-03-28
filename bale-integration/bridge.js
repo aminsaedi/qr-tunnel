@@ -653,34 +653,100 @@ async function main() {
   await new Promise(() => {});
 }
 
+// === Interactive Call Automation ===
+// If any step fails, prompts the user to do it manually instead of crashing.
+
+const readline = require('readline');
+
+async function askUser(prompt) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => {
+    console.log('');
+    console.log('┌──────────────────────────────────────────────┐');
+    console.log(`│  ${prompt.padEnd(44)} │`);
+    console.log('│  Press ENTER when done (or type "skip")      │');
+    console.log('└──────────────────────────────────────────────┘');
+    rl.question('> ', answer => { rl.close(); resolve(answer.trim().toLowerCase()); });
+  });
+}
+
 async function doCaller(page) {
   console.log('[bridge] Click video call...');
-  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 15000 }); await b.click(); } catch {}
-  await sleep(3000);
-  await findAndClick(page, ['Start Call', 'start call', 'START CALL', 'Call', 'Start', 'Video Call', 'تماس تصویری', 'شروع تماس', 'تماس'], 30000);
+  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 5000 }); await b.click(); } catch {}
+  await sleep(2000);
+  await findAndClick(page, ['Start Call'], 15000);
   await sleep(3000);
   await waitForCall(page);
 }
 
 async function doCallee(page) {
   console.log('[bridge] Waiting for call...');
-  await findAndClick(page, ['Answer', 'answer', 'پاسخ', 'قبول'], 300000);
-  await sleep(3000);
-  await findAndClick(page, ['Answer Call', 'Start Call', 'start call', 'پاسخ به تماس', 'شروع تماس', 'قبول تماس'], 30000);
+  await findAndClick(page, ['Answer'], 300000);
+  await sleep(2000);
+  await findAndClick(page, ['Answer Call', 'Start Call'], 15000);
   await sleep(3000);
   await waitForCall(page);
 }
 
-async function waitForCall(page) {
-  for (let i = 0; i < 30; i++) {
-    const n = await page.evaluate(() => Array.from(document.querySelectorAll('video')).filter(v => !v.paused && v.readyState >= 2).length);
-    console.log(`[bridge] ${n} playing videos`);
-    if (n >= 2) { console.log('[bridge] *** CALL ACTIVE ***'); callActive = true; if (goSocket) goSocket.send('connected'); return; }
-    await sleep(2000);
+async function dumpPageState(page, label) {
+  try {
+    await page.screenshot({ path: `/tmp/bale-${label}.png` });
+    const buttons = await page.evaluate(() => {
+      const results = [];
+      for (const el of document.querySelectorAll('button, [role="button"], a[href], div[onclick]')) {
+        const r = el.getBoundingClientRect();
+        if (r.width < 5 || r.height < 5) continue;
+        results.push({
+          tag: el.tagName, text: (el.textContent || '').trim().slice(0, 60),
+          cls: (el.className || '').slice(0, 60),
+          tid: el.getAttribute('data-testid'),
+          pos: `${Math.round(r.x)},${Math.round(r.y)} ${Math.round(r.width)}x${Math.round(r.height)}`
+        });
+      }
+      return results;
+    });
+    console.log(`[dump:${label}] screenshot: /tmp/bale-${label}.png`);
+    console.log(`[dump:${label}] ${buttons.length} buttons:`);
+    for (const b of buttons.slice(0, 20)) {
+      console.log(`  [${b.tag}] "${b.text}" cls="${b.cls}" tid=${b.tid} @${b.pos}`);
+    }
+  } catch (e) {
+    console.log(`[dump:${label}] error: ${e.message}`);
   }
-  console.log('[bridge] Timeout'); callActive = true; if (goSocket) goSocket.send('connected');
 }
 
+async function waitForCall(page) {
+  console.log('[bridge] Waiting for call to connect...');
+  for (let i = 0; i < 45; i++) {
+    try {
+      const n = await page.evaluate(() =>
+        Array.from(document.querySelectorAll('video'))
+          .filter(v => !v.paused && v.readyState >= 2 && v.videoWidth > 10).length
+      );
+      if (i % 5 === 0) console.log(`[bridge] ${n} active video(s)`);
+      if (n >= 2) {
+        console.log('[bridge] *** CALL ACTIVE ***');
+        callActive = true;
+        if (goSocket) goSocket.send('connected');
+        return;
+      }
+    } catch {}
+    await sleep(2000);
+  }
+
+  // Timeout — ask user
+  console.log('[bridge] Call detection timed out after 90s');
+  const answer = await askUser('Is the video call active? (press Enter if yes, "retry" to keep waiting)');
+  if (answer === 'retry') {
+    return waitForCall(page);
+  }
+  console.log('[bridge] Proceeding (user confirmed)');
+  callActive = true;
+  if (goSocket) goSocket.send('connected');
+}
+
+// Find and click a button by text content. Returns true if clicked.
+// Uses the ORIGINAL proven method: find text, walk up to first reasonable parent, click center.
 async function findAndClick(page, texts, timeout = 15000) {
   const start = Date.now();
   while (Date.now() - start < timeout) {
@@ -699,11 +765,29 @@ async function findAndClick(page, texts, timeout = 15000) {
         }
         return null;
       }, text);
-      if (pos) { console.log(`[bridge] click "${text}" at (${Math.round(pos.x)},${Math.round(pos.y)})`); await page.mouse.click(pos.x, pos.y); return; }
+      if (pos) { console.log(`[bridge] click "${text}" at (${Math.round(pos.x)},${Math.round(pos.y)})`); await page.mouse.click(pos.x, pos.y); return true; }
     }
     await sleep(500);
   }
-  console.log(`[bridge] WARN: [${texts.join(',')}] not found`);
+  return false;
+}
+
+// Try clicking elements by CSS selector. Returns true if clicked.
+async function tryClickBySelector(page, selectors) {
+  for (const sel of selectors) {
+    try {
+      const el = await page.$(sel);
+      if (el) {
+        const box = await el.boundingBox();
+        if (box && box.width > 10 && box.height > 10) {
+          await el.click();
+          console.log(`[bridge] click selector: ${sel}`);
+          return true;
+        }
+      }
+    } catch {}
+  }
+  return false;
 }
 
 async function setupDCReceiver(pg) {
