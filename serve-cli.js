@@ -6,6 +6,26 @@ const readline = require('readline');
 const path = require('path');
 const fs = require('fs');
 
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  console.log(`
+Usage: node serve-cli.js [options]
+
+QR Tunnel Server — opens Bale, monitors for incoming video calls,
+and provides internet access to callers via SOCKS5/HTTP proxy.
+
+Options:
+  --auto-answer, -a       Answer calls automatically (default: prompt)
+  --disable-health-check  Skip Bale availability monitoring
+  --help, -h              Show this help
+
+Examples:
+  node serve-cli.js                     Interactive — prompts per call
+  node serve-cli.js --auto-answer       Auto-answer for background/tmux
+  node serve-cli.js -a --disable-health-check   Auto-answer, no health check
+`);
+  process.exit(0);
+}
+
 const autoAnswer = process.argv.includes('--auto-answer') || process.argv.includes('-a');
 const healthCheckDisabled = process.argv.includes('--disable-health-check');
 const projectDir = path.resolve(__dirname);
