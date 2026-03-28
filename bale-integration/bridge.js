@@ -91,18 +91,13 @@ async function forwardToDC(payload) {
       const dc = window.__lkSendDC || (window.__dcAll || []).find(d => d.label === '_reliable' && d.dir === 'local' && d.dc.readyState === 'open')?.dc;
       if (!dc || dc.readyState !== 'open') return false;
       dc.send(packetBytes);
+      // Update TX stats in same evaluate (no extra round-trip)
+      const s = window.__tunnelStats;
+      if (s) { s.txBytes += raw.length; s.txPkts++; s.connected = true; s.mode = 'datachannel'; if (!s.startTime) s.startTime = Date.now(); s.lastActivity = Date.now(); }
       return window.LKProto ? 'sdk' : 'manual';
     }, b64);
     if (sent) {
       dcTxCount++;
-      // Update page stats
-      await page.evaluate((len) => {
-        const s = window.__tunnelStats;
-        s.txBytes += len; s.txPkts++;
-        s.connected = true; s.mode = 'datachannel';
-        if (!s.startTime) s.startTime = Date.now();
-        s.lastActivity = Date.now();
-      }, payload.length).catch(() => {});
       if (dcTxCount % 100 === 1) console.log(`[DC-tx] #${dcTxCount} via ${sent} (${payload.length} bytes)`);
     } else {
       if (dcTxCount === 0) console.log('[DC-tx] no DC available, dropping');
@@ -625,23 +620,18 @@ async function main() {
         if (!window.__dcRecvQueue || window.__dcRecvQueue.length === 0) return null;
         const msgs = window.__dcRecvQueue;
         window.__dcRecvQueue = [];
+        // Update RX stats in the same evaluate call (no extra round-trip)
+        let bytes = 0;
+        for (const m of msgs) bytes += m.length;
+        const s = window.__tunnelStats;
+        if (s) { s.rxBytes += bytes; s.rxPkts += msgs.length; s.connected = true; s.mode = 'datachannel'; if (!s.startTime) s.startTime = Date.now(); s.lastActivity = Date.now(); }
         return msgs;
       });
       if (messages && messages.length > 0) {
-        let batchBytes = 0;
         for (const msg of messages) {
           sendDCToGo(Buffer.from(msg));
           dcRxCount++;
-          batchBytes += msg.length;
         }
-        // Update page stats
-        page.evaluate((bytes, pkts) => {
-          const s = window.__tunnelStats;
-          s.rxBytes += bytes; s.rxPkts += pkts;
-          s.connected = true; s.mode = 'datachannel';
-          if (!s.startTime) s.startTime = Date.now();
-          s.lastActivity = Date.now();
-        }, batchBytes, messages.length).catch(() => {});
         if (dcRxCount % 100 < messages.length) {
           console.log(`[DC-rx] total=${dcRxCount}, batch=${messages.length}`);
         }
