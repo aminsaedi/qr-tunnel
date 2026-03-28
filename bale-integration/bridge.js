@@ -532,6 +532,14 @@ async function main() {
 
   console.log('[bridge] Opening Bale...');
   if (role === 'caller') {
+    // Open Bale homepage first — gives time to log in if needed
+    await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded', timeout: 120000 });
+    // Countdown: 60 seconds for login/load, then navigate to chat
+    for (let sec = 60; sec > 0; sec--) {
+      process.stdout.write(`\r[bridge] Navigating to chat in ${sec}s... (log in to Bale if needed) `);
+      await sleep(1000);
+    }
+    process.stdout.write('\r[bridge] Navigating to chat...                                      \n');
     await page.goto(`https://web.bale.ai/chat?uid=${targetUser}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
   } else {
     await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded', timeout: 120000 });
