@@ -56,9 +56,9 @@ func (e *Encoder) EncodePacket(seqNum uint16, payload []byte) *image.RGBA {
 			if by > 0 && by < grid-1 && bx > 0 && bx < grid-1 {
 				continue // inner area, skip
 			}
-			// Checkerboard: phase alternates by seqNum for frame-change detection
-			phase := int(seqNum) % 2
-			isLight := ((bx + by + phase) % 2) == 0
+			// Static checkerboard — no phase change between frames.
+			// VP9 temporal prediction works much better with static borders.
+			isLight := ((bx + by) % 2) == 0
 			var lum uint8
 			if isLight {
 				lum = Levels2[3] // 240

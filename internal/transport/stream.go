@@ -313,7 +313,7 @@ func (s *Stream) getPendingFrames() []*transportFrame {
 	now := time.Now()
 	var keepBuf []pendingSegment
 	for i := range s.sendBuf {
-		if s.sendBuf[i].retries >= 5 {
+		if s.sendBuf[i].retries >= 30 {
 			continue // give up — stop wasting bandwidth
 		}
 		keepBuf = append(keepBuf, s.sendBuf[i])

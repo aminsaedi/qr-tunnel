@@ -68,6 +68,32 @@ const INIT_SCRIPT = `
   window.__goFrame = null;
   window.__qrCanvas = null;
   window.__qrCtx = null;
+
+  // === DataChannel Discovery ===
+  // Hook RTCPeerConnection to find LiveKit's DataChannels
+  window.__dcAll = [];
+  window.__pcAll = [];
+  const _origPC = window.RTCPeerConnection;
+  window.RTCPeerConnection = function(...args) {
+    const pc = new _origPC(...args);
+    window.__pcAll.push(pc);
+    console.log('[DC] PeerConnection #' + window.__pcAll.length);
+    const _origCreateDC = pc.createDataChannel.bind(pc);
+    pc.createDataChannel = function(label, opts) {
+      const dc = _origCreateDC(label, opts);
+      console.log('[DC] createDataChannel: ' + label + ' ' + JSON.stringify(opts||{}));
+      window.__dcAll.push({label, dc, pc, dir:'local'});
+      dc.onopen = () => console.log('[DC] OPEN: ' + label);
+      return dc;
+    };
+    pc.addEventListener('datachannel', (e) => {
+      console.log('[DC] remote datachannel: ' + e.channel.label);
+      window.__dcAll.push({label: e.channel.label, dc: e.channel, pc, dir:'remote'});
+    });
+    return pc;
+  };
+  window.RTCPeerConnection.prototype = _origPC.prototype;
+  Object.keys(_origPC).forEach(k => { try { window.RTCPeerConnection[k] = _origPC[k]; } catch(e){} });
   window.__frameN = 0;
 
   const origGUM = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
@@ -210,26 +236,30 @@ const INIT_SCRIPT = `
     }
     try {
       window.__captureCtx.drawImage(v, 0, 0, 720, 720);
-      return { dataUrl: window.__captureCanvas.toDataURL('image/jpeg', 0.92), vw: v.videoWidth, vh: v.videoHeight };
+      return { dataUrl: window.__captureCanvas.toDataURL('image/png'), vw: v.videoWidth, vh: v.videoHeight };
     } catch(e) { return { error: e.message }; }
   };
 })();
 `;
 
 async function main() {
-  const context = await chromium.launchPersistentContext(profileDir, {
+  const launchOpts = {
     headless: false,
     args: [
       '--disable-blink-features=AutomationControlled', '--no-sandbox', '--no-proxy-server',
       '--disable-web-security', '--disable-site-isolation-trials',
       '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${FAKE_CAMERA}`,
-      // Enable experimental APIs for TransformStream pipeline
       '--enable-blink-features=MediaStreamInsertableStreams',
     ],
     viewport: { width: 1280, height: 800 },
     permissions: ['camera', 'microphone'],
     ignoreHTTPSErrors: true,
-  });
+  };
+  // Use system Chrome if set (avoids needing Playwright's bundled Chromium)
+  if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
+    launchOpts.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  }
+  const context = await chromium.launchPersistentContext(profileDir, launchOpts);
 
   page = context.pages()[0] || await context.newPage();
   await page.addInitScript(INIT_SCRIPT);
@@ -259,24 +289,39 @@ async function main() {
 
   startCapture(page);
   console.log('[bridge] Running.');
+
+  // Log DataChannel state every 10 seconds
+  setInterval(async () => {
+    try {
+      const dcState = await page.evaluate(() => {
+        return (window.__dcAll || []).map(d => ({
+          label: d.label, dir: d.dir, state: d.dc.readyState
+        }));
+      });
+      if (dcState.length > 0) {
+        console.log('[DC-state]', JSON.stringify(dcState));
+      }
+    } catch {}
+  }, 10000);
+
   process.on('SIGINT', async () => { wss.close(); await context.close(); process.exit(0); });
   await new Promise(() => {});
 }
 
 async function doCaller(page) {
   console.log('[bridge] Click video call...');
-  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 5000 }); await b.click(); } catch {}
-  await sleep(2000);
-  await findAndClick(page, ['Start Call']);
+  try { const b = await page.waitForSelector('[data-testid="video-"]', { timeout: 15000 }); await b.click(); } catch {}
+  await sleep(3000);
+  await findAndClick(page, ['Start Call', 'start call', 'START CALL', 'Call', 'Start', 'Video Call', 'تماس تصویری', 'شروع تماس', 'تماس'], 30000);
   await sleep(3000);
   await waitForCall(page);
 }
 
 async function doCallee(page) {
   console.log('[bridge] Waiting for call...');
-  await findAndClick(page, ['Answer'], 300000);
-  await sleep(2000);
-  await findAndClick(page, ['Answer Call', 'Start Call'], 15000);
+  await findAndClick(page, ['Answer', 'answer', 'پاسخ', 'قبول'], 300000);
+  await sleep(3000);
+  await findAndClick(page, ['Answer Call', 'Start Call', 'start call', 'پاسخ به تماس', 'شروع تماس', 'قبول تماس'], 30000);
   await sleep(3000);
   await waitForCall(page);
 }

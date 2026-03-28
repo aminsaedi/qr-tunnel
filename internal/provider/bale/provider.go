@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"image"
 	"image/jpeg"
+	_ "image/png" // register PNG decoder for image.Decode
 	"log"
 	"sync"
 	"time"
@@ -125,9 +126,9 @@ func (p *BaleProvider) readLoop() {
 
 		width := int(binary.BigEndian.Uint16(data[4:6]))
 		height := int(binary.BigEndian.Uint16(data[6:8]))
-		jpegData := data[frameHeaderSize:]
+		imgData := data[frameHeaderSize:]
 
-		img, err := jpeg.Decode(bytes.NewReader(jpegData))
+		img, _, err := image.Decode(bytes.NewReader(imgData))
 		if err != nil {
 			continue
 		}
@@ -150,7 +151,7 @@ func (p *BaleProvider) readLoop() {
 		})
 		p.rxCount++
 		if p.rxCount%30 == 1 {
-			log.Printf("[bale] rx frame #%d (%dx%d, %d bytes JPEG)", p.rxCount, width, height, len(jpegData))
+			log.Printf("[bale] rx frame #%d (%dx%d, %d bytes)", p.rxCount, width, height, len(imgData))
 		}
 	}
 }
@@ -173,7 +174,7 @@ func (p *BaleProvider) SendFrame(frame *provider.Frame) error {
 	binary.BigEndian.PutUint16(header[6:8], uint16(frame.Height))
 	buf.Write(header)
 
-	if err := jpeg.Encode(&buf, frame.Image, &jpeg.Options{Quality: 95}); err != nil {
+	if err := jpeg.Encode(&buf, frame.Image, &jpeg.Options{Quality: 100}); err != nil {
 		return fmt.Errorf("jpeg encode: %w", err)
 	}
 
