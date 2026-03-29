@@ -380,6 +380,16 @@ func runBaleClient(args []string) {
 	tr := transport.NewTransport(p, tConfig)
 	defer tr.Close()
 
+	// Heartbeat: exit when tunnel is dead so the wrapper script can reconnect
+	deadCh := make(chan struct{}, 1)
+	tr.OnDead = func() {
+		log.Println("[heartbeat] Tunnel dead — exiting for reconnect")
+		select {
+		case deadCh <- struct{}{}:
+		default:
+		}
+	}
+
 	// Start SOCKS5
 	socksServer := socks5.NewServer(tr)
 	if err := socksServer.Start(*socksAddr); err != nil {
@@ -404,7 +414,10 @@ func runBaleClient(args []string) {
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	<-sigCh
+	select {
+	case <-sigCh:
+	case <-deadCh:
+	}
 	log.Println("shutting down...")
 }
 
