@@ -94,20 +94,26 @@ func decodeTransportFrame(data []byte) (*transportFrame, error) {
 
 // Config holds transport layer configuration.
 type Config struct {
-	BitmapConfig  bitmap.Config
-	FPS           int           // send-loop tick rate (default 15)
-	WindowSize    int           // sliding window in KB (default 32)
-	RetransmitMin time.Duration // minimum retransmit timeout (default 1s)
-	AckInterval   time.Duration // ACK interval (default 200ms)
-	AdaptiveRate  bool          // enable adaptive send rate (for Bale/VP9)
+	BitmapConfig    bitmap.Config
+	FPS             int           // send-loop tick rate (default 15)
+	WindowSize      int           // sliding window in KB (default 32)
+	RetransmitMin   time.Duration // minimum retransmit timeout (default 1s)
+	AckInterval     time.Duration // ACK interval (default 200ms)
+	AdaptiveRate    bool          // enable adaptive send rate (for Bale/VP9)
+	PingInterval    time.Duration // heartbeat ping interval (default 3s)
+	PongTimeout     time.Duration // declare dead if no pong for this long (default 10s)
+	DataStallTimeout time.Duration // declare dead if no data received for this long (default 15s)
 }
 
 func DefaultConfig() Config {
 	return Config{
-		BitmapConfig:  bitmap.DefaultConfig(),
-		FPS:           15,
-		WindowSize:    32,
-		RetransmitMin: 1 * time.Second, // Fast retransmit for VP9 frame loss
+		BitmapConfig:     bitmap.DefaultConfig(),
+		FPS:              15,
+		WindowSize:       32,
+		RetransmitMin:    1 * time.Second,
+		PingInterval:     3 * time.Second,
+		PongTimeout:      10 * time.Second,
+		DataStallTimeout: 15 * time.Second,
 		AckInterval:   200 * time.Millisecond,
 	}
 }
@@ -141,8 +147,9 @@ type Transport struct {
 	adaptive *AdaptiveController
 
 	// Heartbeat
-	lastPong     atomic.Int64 // unix nanos of last pong received
-	OnDead       func()       // called when heartbeat fails (tunnel is dead)
+	lastPong         atomic.Int64 // unix nanos of last pong received
+	lastDataReceived atomic.Int64 // unix nanos of last real data (DATA/SYN) received
+	OnDead           func()       // called when heartbeat fails (tunnel is dead)
 
 	// Metrics
 	BytesSent     atomic.Int64
@@ -221,8 +228,10 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	// Start send loop
 	go t.sendLoop()
 
-	// Start heartbeat — sends PING every 5s, declares dead after 3 missed PONGs (15s)
-	t.lastPong.Store(time.Now().UnixNano())
+	// Start heartbeat
+	now := time.Now().UnixNano()
+	t.lastPong.Store(now)
+	t.lastDataReceived.Store(now)
 	go t.heartbeatLoop()
 
 	// Start stream reaper — closes zombie streams that accumulate when
@@ -276,13 +285,29 @@ func (t *Transport) OpenStream(id uint16, synPayload ...[]byte) *Stream {
 }
 
 // streamReaper periodically closes idle/zombie streams.
-// heartbeatLoop sends PING every 5s and declares the tunnel dead if no PONG
-// received for 20s. Also monitors stream health — if streams are stalled
-// (data queued but nothing delivered) for 30s, declares dead.
+// heartbeatLoop sends PING at config.PingInterval and declares the tunnel dead if:
+// - No PONG for config.PongTimeout (tunnel completely unreachable)
+// - Active streams but no real data received for config.DataStallTimeout (tunnel alive but stalled)
 func (t *Transport) heartbeatLoop() {
-	ticker := time.NewTicker(5 * time.Second)
+	pingInterval := t.config.PingInterval
+	if pingInterval == 0 {
+		pingInterval = 3 * time.Second
+	}
+	pongTimeout := t.config.PongTimeout
+	if pongTimeout == 0 {
+		pongTimeout = 10 * time.Second
+	}
+	dataStallTimeout := t.config.DataStallTimeout
+	if dataStallTimeout == 0 {
+		dataStallTimeout = 15 * time.Second
+	}
+
+	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 	deadNotified := false
+
+	log.Printf("[heartbeat] started: ping=%s pongTimeout=%s dataStall=%s",
+		pingInterval, pongTimeout, dataStallTimeout)
 
 	for {
 		select {
@@ -297,12 +322,12 @@ func (t *Transport) heartbeatLoop() {
 		default:
 		}
 
-		// Check last PONG
+		// Check 1: PONG timeout — tunnel completely unreachable
 		lastPong := time.Unix(0, t.lastPong.Load())
 		sincePong := time.Since(lastPong)
 
-		if sincePong > 20*time.Second && !deadNotified {
-			log.Printf("[heartbeat] DEAD — no PONG for %.0fs", sincePong.Seconds())
+		if sincePong > pongTimeout && !deadNotified {
+			log.Printf("[heartbeat] DEAD — no PONG for %.0fs (timeout: %s)", sincePong.Seconds(), pongTimeout)
 			deadNotified = true
 			if t.OnDead != nil {
 				t.OnDead()
@@ -310,20 +335,29 @@ func (t *Transport) heartbeatLoop() {
 			continue
 		}
 
-		// Reset dead notification when pong comes back
-		if sincePong < 10*time.Second {
-			deadNotified = false
-		}
-
-		// Check stream health: if we have active streams but BytesReceived
-		// hasn't changed in 30s, the tunnel is stalled
+		// Check 2: Data stall — pong works but no real data flowing
+		// Only check if there are active streams (otherwise idle is normal)
 		t.mu.RLock()
 		activeStreams := len(t.streams)
 		t.mu.RUnlock()
 
-		if activeStreams > 2 && sincePong < 10*time.Second {
-			// Tunnel is alive but check if data is actually flowing
-			// (pong works but real traffic might be stuck)
+		if activeStreams > 0 {
+			lastData := time.Unix(0, t.lastDataReceived.Load())
+			sinceData := time.Since(lastData)
+			if sinceData > dataStallTimeout && !deadNotified {
+				log.Printf("[heartbeat] STALLED — %d streams but no data for %.0fs (timeout: %s)",
+					activeStreams, sinceData.Seconds(), dataStallTimeout)
+				deadNotified = true
+				if t.OnDead != nil {
+					t.OnDead()
+				}
+				continue
+			}
+		}
+
+		// Reset dead notification when things recover
+		if sincePong < pongTimeout/2 {
+			deadNotified = false
 		}
 	}
 }
@@ -437,6 +471,7 @@ func (t *Transport) handleFrame(f *transportFrame) {
 
 	// Handle SYN for new incoming streams
 	if f.Flags&FlagSYN != 0 && !exists {
+		t.lastDataReceived.Store(time.Now().UnixNano())
 		t.mu.Lock()
 		stream = newStream(f.StreamID, t)
 		stream.state = streamStateOpen
@@ -490,6 +525,7 @@ func (t *Transport) handleFrame(f *transportFrame) {
 	if f.Flags&FlagDATA != 0 && len(f.Payload) > 0 {
 		stream.handleData(f.SeqNum, f.Payload)
 		t.BytesReceived.Add(int64(len(f.Payload)))
+		t.lastDataReceived.Store(time.Now().UnixNano())
 	}
 
 	// Handle FIN — close and remove stream
