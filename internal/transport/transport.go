@@ -449,12 +449,14 @@ func (t *Transport) sendLoop() {
 		}
 
 		iteration++
-		if iteration%20 == 1 {
+		// Only log when there's activity (queue > 0) or every 500th tick
+		qLen := len(t.sendQueue)
+		if qLen > 0 || iteration%500 == 1 {
 			tick := fixedTick
 			if t.adaptive != nil {
 				tick = t.adaptive.TickInterval()
 			}
-			log.Printf("[sendLoop] tick #%d, queue=%d, interval=%dms", iteration, len(t.sendQueue), tick.Milliseconds())
+			log.Printf("[sendLoop] tick #%d, queue=%d, interval=%dms", iteration, qLen, tick.Milliseconds())
 		}
 
 		t.sendPendingFrames()

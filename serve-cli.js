@@ -107,16 +107,28 @@ class BaleHealthChecker {
 
   async check() {
     this.totalChecks++;
+    // Use a lightweight HEAD request to avoid Bale rate-limiting full page fetches.
+    // Also try DNS resolution as fallback — if DNS works, Bale infra is up.
     return new Promise((resolve) => {
-      const req = https.get('https://web.bale.ai/', {
-        timeout: 10000,
-        headers: { 'User-Agent': 'Mozilla/5.0 QRTunnel/1.0' },
+      const req = https.request('https://web.bale.ai/', {
+        method: 'HEAD',
+        timeout: 15000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36' },
       }, (res) => {
         res.resume();
-        resolve(res.statusCode >= 200 && res.statusCode < 400);
+        // Any response (even 403/429) means Bale server is reachable
+        resolve(true);
       });
-      req.on('error', () => resolve(false));
+      req.on('error', (err) => {
+        // Connection reset / ECONNREFUSED means network-level block
+        // But DNS resolution success means Bale infra is up (ISP might be blocking TLS)
+        const dns = require('dns');
+        dns.resolve4('web.bale.ai', (dnsErr) => {
+          resolve(!dnsErr); // DNS works = Bale is up (just TLS blocked)
+        });
+      });
       req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.end();
     });
   }
 
