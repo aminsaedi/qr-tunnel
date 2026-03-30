@@ -92,6 +92,28 @@ func decodeTransportFrame(data []byte) (*transportFrame, error) {
 	return f, nil
 }
 
+// decodeTransportFrameNoCRC is a fast decoder that skips CRC verification.
+// Used in DataChannel mode where the underlying WebSocket guarantees integrity.
+func decodeTransportFrameNoCRC(data []byte) (*transportFrame, error) {
+	if len(data) < transportHeaderSize {
+		return nil, fmt.Errorf("frame too short: %d", len(data))
+	}
+	payloadLen := binary.BigEndian.Uint16(data[13:15])
+	totalLen := transportHeaderSize + int(payloadLen)
+	if totalLen > len(data) {
+		return nil, fmt.Errorf("payload length mismatch: need %d have %d", totalLen, len(data))
+	}
+	f := &transportFrame{
+		Flags:      data[0],
+		StreamID:   binary.BigEndian.Uint16(data[1:3]),
+		SeqNum:     binary.BigEndian.Uint32(data[3:7]),
+		AckNum:     binary.BigEndian.Uint32(data[7:11]),
+		WindowSize: binary.BigEndian.Uint16(data[11:13]),
+	}
+	f.Payload = data[transportHeaderSize:totalLen]
+	return f, nil
+}
+
 // Config holds transport layer configuration.
 type Config struct {
 	BitmapConfig    bitmap.Config
@@ -148,7 +170,9 @@ type Transport struct {
 
 	// Heartbeat
 	lastPong         atomic.Int64 // unix nanos of last pong received
+	lastPingSent     atomic.Int64 // unix nanos of last ping sent (for RTT measurement)
 	lastDataReceived atomic.Int64 // unix nanos of last real data (DATA/SYN) received
+	lastDataSent     atomic.Int64 // unix nanos of last real data sent (DATA frames) — updated on TX so downloads don't false-stall
 	OnDead           func()       // called when heartbeat fails (tunnel is dead)
 
 	// Metrics
@@ -166,7 +190,7 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 		decoder:     bitmap.NewDecoder(config.BitmapConfig),
 		config:      config,
 		streams:     make(map[uint16]*Stream),
-		sendQueue:   make(chan *transportFrame, 32),
+		sendQueue:   make(chan *transportFrame, 256),
 		acceptQueue: make(chan *Stream, 16),
 		ctx:         ctx,
 		cancel:      cancel,
@@ -232,6 +256,7 @@ func NewTransport(p provider.CallProvider, config Config) *Transport {
 	now := time.Now().UnixNano()
 	t.lastPong.Store(now)
 	t.lastDataReceived.Store(now)
+	t.lastDataSent.Store(now)
 	go t.heartbeatLoop()
 
 	// Start stream reaper — closes zombie streams that accumulate when
@@ -267,6 +292,9 @@ func (t *Transport) OpenStream(id uint16, synPayload ...[]byte) *Stream {
 
 	s := newStream(id, t)
 	t.streams[id] = s
+
+	// Reset data stall timer — we're actively opening a stream
+	t.lastDataReceived.Store(time.Now().UnixNano())
 
 	// Send SYN (with payload if provided — carries destination address)
 	var payload []byte
@@ -316,7 +344,8 @@ func (t *Transport) heartbeatLoop() {
 		case <-ticker.C:
 		}
 
-		// Send PING
+		// Send PING (record send time for RTT measurement)
+		t.lastPingSent.Store(time.Now().UnixNano())
 		select {
 		case t.sendQueue <- &transportFrame{Flags: FlagPING}:
 		default:
@@ -342,7 +371,15 @@ func (t *Transport) heartbeatLoop() {
 		t.mu.RUnlock()
 
 		if activeStreams > 0 {
-			lastData := time.Unix(0, t.lastDataReceived.Load())
+			// Use max(lastDataReceived, lastDataSent) — a download keeps lastDataSent
+			// fresh even when the receiver sends no DATA back (only ACKs).
+			rxNano := t.lastDataReceived.Load()
+			txNano := t.lastDataSent.Load()
+			lastActivityNano := rxNano
+			if txNano > lastActivityNano {
+				lastActivityNano = txNano
+			}
+			lastData := time.Unix(0, lastActivityNano)
 			sinceData := time.Since(lastData)
 			if sinceData > dataStallTimeout && !deadNotified {
 				log.Printf("[heartbeat] STALLED — %d streams but no data for %.0fs (timeout: %s)",
@@ -426,25 +463,31 @@ func (t *Transport) Close() {
 // handleIncomingData processes reassembled data from the bitmap decoder.
 // The data may contain one or more packed transport frames.
 func (t *Transport) handleIncomingData(data []byte) {
+	skipCRC := t.sendDataDirect != nil // DC mode — reliable WebSocket, CRC is redundant
 	offset := 0
 	for offset < len(data) {
 		if len(data)-offset < transportHeaderSize {
 			break
 		}
 		// Stop at zero bytes (no valid transport frame starts with 3 zero bytes)
-		// This was needed for LT fountain code padding; kept as safety check
 		if offset+2 < len(data) && data[offset] == 0 && data[offset+1] == 0 && data[offset+2] == 0 {
 			break
 		}
-		frame, err := decodeTransportFrame(data[offset:])
+		var frame *transportFrame
+		var err error
+		if skipCRC {
+			frame, err = decodeTransportFrameNoCRC(data[offset:])
+		} else {
+			frame, err = decodeTransportFrame(data[offset:])
+		}
 		if err != nil {
 			break
 		}
 		offset += transportHeaderSize + len(frame.Payload)
-		if frame.Flags != 0 {
-			payloadHash := crc32.ChecksumIEEE(frame.Payload)
-			log.Printf("[transport] rx: flags=0x%02x stream=%d seq=%d ack=%d payload=%d payloadHash=%08x",
-				frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload), payloadHash)
+		// Only log control frames (SYN/FIN/RST) in detail — skip DATA/ACK/PING/PONG in hot path
+		if frame.Flags&(FlagSYN|FlagFIN|FlagRST) != 0 {
+			log.Printf("[transport] rx: flags=0x%02x stream=%d seq=%d ack=%d payload=%d",
+				frame.Flags, frame.StreamID, frame.SeqNum, frame.AckNum, len(frame.Payload))
 		}
 		t.handleFrame(frame)
 	}
@@ -461,7 +504,19 @@ func (t *Transport) handleFrame(f *transportFrame) {
 		return
 	}
 	if f.Flags == FlagPONG {
-		t.lastPong.Store(time.Now().UnixNano())
+		now := time.Now().UnixNano()
+		t.lastPong.Store(now)
+		// Measure RTT from PING→PONG round-trip
+		if pingTime := t.lastPingSent.Load(); pingTime > 0 {
+			rtt := now - pingTime
+			old := t.RTTEstimate.Load()
+			// Exponential moving average: new = 0.7*old + 0.3*sample
+			updated := int64(0.7*float64(old) + 0.3*float64(rtt))
+			if updated < int64(10*time.Millisecond) {
+				updated = int64(10 * time.Millisecond)
+			}
+			t.RTTEstimate.Store(updated)
+		}
 		return
 	}
 
@@ -561,16 +616,6 @@ func (t *Transport) sendLoop() {
 		}
 
 		iteration++
-		// Only log when there's activity (queue > 0) or every 500th tick
-		qLen := len(t.sendQueue)
-		if qLen > 0 || iteration%500 == 1 {
-			tick := fixedTick
-			if t.adaptive != nil {
-				tick = t.adaptive.TickInterval()
-			}
-			log.Printf("[sendLoop] tick #%d, queue=%d, interval=%dms", iteration, qLen, tick.Milliseconds())
-		}
-
 		t.sendPendingFrames()
 
 		// Use adaptive tick if available
@@ -590,7 +635,6 @@ func (t *Transport) sendPendingFrames() bool {
 		maxPayload = 64 * 1024 // 64KB per batch — well within DC limits
 	}
 	var packed []byte
-	queueLen := len(t.sendQueue)
 
 	// PRIORITY 1: New data from queue (fresh SYNs, DATA, FINs)
 	for {
@@ -625,9 +669,6 @@ fillRetransmits:
 	t.mu.RUnlock()
 
 	if len(packed) > 0 {
-		if queueLen > 0 {
-			log.Printf("[transport] sendPending: queue=%d packed=%d bytes", queueLen, len(packed))
-		}
 		t.sendData(packed)
 		return true
 	}
@@ -639,6 +680,7 @@ func (t *Transport) sendData(data []byte) {
 	if t.sendDataDirect != nil {
 		if err := t.sendDataDirect(data); err == nil {
 			t.BytesSent.Add(int64(len(data)))
+			t.lastDataSent.Store(time.Now().UnixNano()) // reset stall timer — we're actively sending
 		} else {
 			log.Printf("[transport] DC send error: %v", err)
 		}

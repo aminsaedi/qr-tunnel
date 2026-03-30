@@ -12,6 +12,10 @@ const wsPort = parseInt(args.find((_, i, a) => a[i - 1] === '--ws-port') || '900
 const profileDir = args.find((_, i, a) => a[i - 1] === '--profile') ||
   path.join(__dirname, role === 'caller' ? 'profile-a' : 'profile-b');
 const autoAnswer = args.includes('--auto-answer');
+// Login wait: how long to wait for manual Bale login (seconds, default 60)
+const loginWait = parseInt(args.find((_, i, a) => a[i - 1] === '--login-wait') || '60');
+// Force login wait: always show countdown even if already logged in
+const forceLoginWait = args.includes('--force-login-wait');
 const FPS = 20; // Higher capture rate for bitmap codec
 const FAKE_CAMERA = '/tmp/qr-fake-camera.y4m';
 
@@ -23,6 +27,15 @@ let dcMode = false; // DataChannel transport mode active
 // --- WS server ---
 const wss = new WebSocketServer({ port: wsPort });
 console.log(`[bridge] WS on :${wsPort}`);
+
+// Write ready file so start scripts can poll instead of sleeping a fixed time.
+// Written immediately — qr-tunnel can connect and wait for 'connected' message.
+const READY_FILE = `/tmp/qr-bridge-${wsPort}.ready`;
+try { require('fs').writeFileSync(READY_FILE, String(process.pid)); } catch {}
+const _cleanupReady = () => { try { require('fs').unlinkSync(READY_FILE); } catch {} };
+process.on('exit', _cleanupReady);
+process.on('SIGINT', () => { _cleanupReady(); process.exit(0); });
+process.on('SIGTERM', () => { _cleanupReady(); process.exit(0); });
 wss.on('connection', ws => {
   console.log('[bridge] Go connected');
   goSocket = ws;
@@ -111,7 +124,8 @@ async function forwardToDC(payload) {
 function sendDCToGo(payload) {
   if (!goSocket || goSocket.readyState !== 1) return;
   const header = Buffer.alloc(1, 0xDC);
-  try { goSocket.send(Buffer.concat([header, Buffer.from(payload)])); } catch {}
+  const buf = typeof payload === 'string' ? Buffer.from(payload, 'base64') : Buffer.from(payload);
+  try { goSocket.send(Buffer.concat([header, buf])); } catch {}
 }
 
 let txCount = 0;
@@ -183,7 +197,7 @@ const INIT_SCRIPT = `
             const payload = window.__extractLKPayload(arr);
             if (payload && payload.length > 0) {
               window.__dcRemoteParsed++;
-              window.__dcRecvQueue.push(Array.from(payload));
+              window.__dcRecvQueue.push(window.__u8toB64(payload));
               if (window.__dcRemoteParsed <= 3) {
                 console.log('[DC-debug] parsed payload size=' + payload.length);
               }
@@ -197,6 +211,16 @@ const INIT_SCRIPT = `
   };
   window.RTCPeerConnection.prototype = _origPC.prototype;
   Object.keys(_origPC).forEach(k => { try { window.RTCPeerConnection[k] = _origPC[k]; } catch(e){} });
+
+  // Fast Uint8Array→base64 (avoids per-byte JSON serialization through page.evaluate)
+  window.__u8toB64 = function(arr) {
+    const C = 8192;
+    let s = '';
+    for (let i = 0; i < arr.length; i += C) {
+      s += String.fromCharCode.apply(null, arr.subarray(i, Math.min(i + C, arr.length)));
+    }
+    return btoa(s);
+  };
 
   // Extract payload from LiveKit DataPacket protobuf
   // DataPacket { kind(1): varint, user(2): UserPacket { payload(2): bytes } }
@@ -247,113 +271,212 @@ const INIT_SCRIPT = `
     txBytes: 0, rxBytes: 0, txPkts: 0, rxPkts: 0,
     startTime: 0, connected: false, mode: 'waiting',
     streams: 0, lastActivity: 0,
+    peakTx: 0, peakRx: 0,
+    txHistory: new Array(60).fill(0),
+    rxHistory: new Array(60).fill(0),
+    _histIdx: 0,
   };
 
-  // Stats dashboard renderer — shown on the fake camera video
+  // Stats dashboard renderer — shown as the local camera feed during the call
   window.__drawTunnelStats = function(ctx, videoOrFrame) {
     const W = 720, H = 720;
     const s = window.__tunnelStats;
     const now = Date.now();
 
-    // Dark background
-    ctx.fillStyle = '#1a1a2e';
+    // ── Background ──
+    ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, W, H);
 
-    // Animated gradient accent bar at top
-    const grad = ctx.createLinearGradient(0, 0, W, 0);
-    grad.addColorStop(0, '#0f3460');
-    grad.addColorStop(0.5, s.connected ? '#16c784' : '#e94560');
-    grad.addColorStop(1, '#0f3460');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, W, 6);
-
-    ctx.textAlign = 'center';
-
-    // Title
-    ctx.fillStyle = '#e6e6e6';
-    ctx.font = 'bold 36px monospace';
-    ctx.fillText('QR TUNNEL', W/2, 60);
-
-    // Status
-    ctx.font = 'bold 24px monospace';
-    if (s.connected) {
-      ctx.fillStyle = '#16c784';
-      ctx.fillText('CONNECTED', W/2, 100);
-      ctx.fillStyle = '#8892b0';
-      ctx.font = '16px monospace';
-      const uptime = Math.floor((now - s.startTime) / 1000);
-      const m = Math.floor(uptime / 60);
-      const sec = uptime % 60;
-      ctx.fillText('Uptime: ' + m + 'm ' + sec + 's', W/2, 125);
-    } else {
-      ctx.fillStyle = '#e94560';
-      ctx.fillText(s.mode === 'datachannel' ? 'DC MODE' : 'WAITING...', W/2, 100);
-    }
-
-    // Stats boxes
-    const boxY = 160;
-    function drawBox(x, y, w, h, label, value, unit) {
-      ctx.fillStyle = 'rgba(255,255,255,0.06)';
-      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.roundRect(x, y, w, h, 8);
-      ctx.fill();
-      ctx.stroke();
-      ctx.fillStyle = '#8892b0';
-      ctx.font = '14px monospace';
-      ctx.textAlign = 'center';
-      ctx.fillText(label, x + w/2, y + 22);
-      ctx.fillStyle = '#e6e6e6';
-      ctx.font = 'bold 28px monospace';
-      ctx.fillText(value, x + w/2, y + 58);
-      ctx.fillStyle = '#8892b0';
-      ctx.font = '12px monospace';
-      ctx.fillText(unit, x + w/2, y + 78);
-    }
-
+    // ── Helpers ──
     function fmtBytes(b) {
-      if (b < 1024) return b + ' B';
-      if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
-      return (b/1024/1024).toFixed(1) + ' MB';
+      if (!b || b < 1) return '0 B';
+      if (b < 1024) return b.toFixed(0) + ' B';
+      if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+      return (b / 1024 / 1024).toFixed(2) + ' MB';
+    }
+    function fmtSpeed(bps) {
+      if (!bps || bps < 1) return '0 B/s';
+      if (bps < 1024) return bps.toFixed(0) + ' B/s';
+      if (bps < 1024 * 1024) return (bps / 1024).toFixed(1) + ' KB/s';
+      return (bps / 1024 / 1024).toFixed(2) + ' MB/s';
     }
 
-    // Speed calc
-    if (!s._lastCheck) { s._lastCheck = now; s._lastTx = 0; s._lastRx = 0; s._txSpeed = 0; s._rxSpeed = 0; }
-    if (now - s._lastCheck > 1000) {
+    // ── Speed sampling — update every 1s ──
+    if (!s._lastCheck) {
+      s._lastCheck = now; s._lastTx = 0; s._lastRx = 0;
+      s._txSpeed = 0; s._rxSpeed = 0;
+    }
+    if (now - s._lastCheck >= 1000) {
       const dt = (now - s._lastCheck) / 1000;
-      s._txSpeed = (s.txBytes - s._lastTx) / dt;
-      s._rxSpeed = (s.rxBytes - s._lastRx) / dt;
-      s._lastCheck = now;
-      s._lastTx = s.txBytes;
-      s._lastRx = s.rxBytes;
+      s._txSpeed = Math.max(0, (s.txBytes - s._lastTx) / dt);
+      s._rxSpeed = Math.max(0, (s.rxBytes - s._lastRx) / dt);
+      s._lastTx = s.txBytes; s._lastRx = s.rxBytes; s._lastCheck = now;
+      s._histIdx = ((s._histIdx || 0) + 1) % 60;
+      s.txHistory[s._histIdx] = s._txSpeed;
+      s.rxHistory[s._histIdx] = s._rxSpeed;
+      s.peakTx = Math.max(s.peakTx || 0, s._txSpeed);
+      s.peakRx = Math.max(s.peakRx || 0, s._rxSpeed);
+    }
+    const staleSec = s.lastActivity ? (now - s.lastActivity) / 1000 : 999;
+
+    // ── Top gradient accent bar ──
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    grad.addColorStop(0, '#161b22');
+    grad.addColorStop(0.5, s.connected ? '#238636' : '#da3633');
+    grad.addColorStop(1, '#161b22');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, 5);
+
+    // ── HEADER: Title + mode badge + status + uptime ──
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#e6edf3';
+    ctx.font = 'bold 38px monospace';
+    ctx.fillText('QR TUNNEL', W / 2, 55);
+
+    // Mode badge pill
+    const modeLabel = s.mode === 'datachannel' ? '⚡ DataChannel' : s.mode === 'bitmap' ? '▦ Bitmap' : '⏳ Waiting';
+    ctx.fillStyle = s.mode === 'datachannel' ? '#1a7f37' : s.mode === 'bitmap' ? '#7d4e00' : '#21262d';
+    ctx.fillRect(W / 2 - 90, 64, 180, 24);
+    ctx.fillStyle = s.mode === 'datachannel' ? '#3fb950' : s.mode === 'bitmap' ? '#d29922' : '#8b949e';
+    ctx.font = 'bold 13px monospace';
+    ctx.fillText(modeLabel, W / 2, 81);
+
+    // Connection status
+    ctx.fillStyle = s.connected ? '#3fb950' : '#f85149';
+    ctx.font = 'bold 22px monospace';
+    ctx.fillText(s.connected ? '● CONNECTED' : '● ' + (s.mode || 'WAITING').toUpperCase(), W / 2, 114);
+
+    // Uptime
+    const uptime = s.startTime ? Math.floor((now - s.startTime) / 1000) : 0;
+    const um = Math.floor(uptime / 60), us = uptime % 60;
+    ctx.fillStyle = '#8b949e';
+    ctx.font = '13px monospace';
+    ctx.fillText('Uptime: ' + um + 'm ' + us + 's', W / 2, 133);
+
+    // Connection quality bar (fades as data goes stale)
+    const quality = s.connected ? Math.max(0, 1 - staleSec / 30) : 0;
+    ctx.fillStyle = '#21262d';
+    ctx.fillRect(40, 144, W - 80, 7);
+    if (quality > 0.01) {
+      const qGrad = ctx.createLinearGradient(40, 0, W - 40, 0);
+      qGrad.addColorStop(0, '#238636');
+      qGrad.addColorStop(Math.min(quality, 0.99), quality > 0.5 ? '#3fb950' : quality > 0.2 ? '#d29922' : '#f85149');
+      qGrad.addColorStop(1, '#21262d');
+      ctx.fillStyle = qGrad;
+      ctx.fillRect(40, 144, (W - 80) * quality, 7);
+    }
+    ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+    ctx.strokeRect(40, 144, W - 80, 7);
+
+    // ── SPEED GRAPHS ──
+    const gX = 40, gW = W - 80;
+
+    function drawSparkline(gx, gy, gw, gh, histData, idx, barColor) {
+      const N = histData.length;
+      const barW = gw / N;
+      ctx.fillStyle = '#0d1117';
+      ctx.fillRect(gx, gy, gw, gh);
+      // 50% gridline
+      ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(gx, gy + gh / 2); ctx.lineTo(gx + gw, gy + gh / 2); ctx.stroke();
+      const peak = Math.max(...histData, 1);
+      for (let i = 0; i < N; i++) {
+        const di = (idx - N + 1 + i + N) % N;
+        const bh = Math.round((histData[di] / peak) * gh);
+        if (bh < 1) continue;
+        ctx.globalAlpha = 0.3 + 0.7 * (i / (N - 1));
+        ctx.fillStyle = barColor;
+        ctx.fillRect(gx + i * barW, gy + gh - bh, Math.max(1, barW - 1), bh);
+      }
+      ctx.globalAlpha = 1;
+      ctx.strokeStyle = '#30363d';
+      ctx.strokeRect(gx, gy, gw, gh);
     }
 
-    const bw = 155, bh = 90, gap = 15;
-    const startX = (W - 4*bw - 3*gap) / 2;
+    // TX
+    const txLabelY = 168, txGraphY = txLabelY + 8, txGraphH = 65;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#3fb950'; ctx.font = 'bold 13px monospace';
+    ctx.fillText('↑ TX', gX, txLabelY);
+    ctx.fillStyle = '#6e7681'; ctx.font = '11px monospace';
+    ctx.fillText('peak ' + fmtSpeed(s.peakTx || 0), gX + 50, txLabelY);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 16px monospace';
+    ctx.fillText(fmtSpeed(s._txSpeed || 0), gX + gW, txLabelY);
+    drawSparkline(gX, txGraphY, gW, txGraphH, s.txHistory || new Array(60).fill(0), s._histIdx || 0, '#2ea043');
 
-    drawBox(startX, boxY, bw, bh, 'TX DATA', fmtBytes(s.txBytes), s.txPkts + ' packets');
-    drawBox(startX+bw+gap, boxY, bw, bh, 'RX DATA', fmtBytes(s.rxBytes), s.rxPkts + ' packets');
-    drawBox(startX+2*(bw+gap), boxY, bw, bh, 'TX SPEED', fmtBytes(Math.round(s._txSpeed||0)) + '/s', '');
-    drawBox(startX+3*(bw+gap), boxY, bw, bh, 'RX SPEED', fmtBytes(Math.round(s._rxSpeed||0)) + '/s', '');
+    // RX
+    const rxLabelY = txGraphY + txGraphH + 18, rxGraphY = rxLabelY + 8, rxGraphH = 65;
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#58a6ff'; ctx.font = 'bold 13px monospace';
+    ctx.fillText('↓ RX', gX, rxLabelY);
+    ctx.fillStyle = '#6e7681'; ctx.font = '11px monospace';
+    ctx.fillText('peak ' + fmtSpeed(s.peakRx || 0), gX + 50, rxLabelY);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 16px monospace';
+    ctx.fillText(fmtSpeed(s._rxSpeed || 0), gX + gW, rxLabelY);
+    drawSparkline(gX, rxGraphY, gW, rxGraphH, s.rxHistory || new Array(60).fill(0), s._histIdx || 0, '#1f6feb');
 
-    // Second row
-    const row2Y = boxY + bh + gap;
-    drawBox(startX, row2Y, bw, bh, 'MODE', s.mode === 'datachannel' ? 'DC' : s.mode, s.mode === 'datachannel' ? 'DataChannel' : '');
-    drawBox(startX+bw+gap, row2Y, bw, bh, 'STREAMS', '' + s.streams, 'active');
+    // ── STATS BOXES — 2 rows of 4 ──
+    const boxY1 = rxGraphY + rxGraphH + 18;
+    const bw = 155, bh = 80, bgap = 13;
+    const bsX = (W - 4 * bw - 3 * bgap) / 2;
 
-    // Activity indicator
-    const active = s.lastActivity && (now - s.lastActivity) < 2000;
-    ctx.fillStyle = active ? '#16c784' : '#3a3a5c';
-    ctx.beginPath();
-    ctx.arc(W - 30, 30, 8, 0, Math.PI * 2);
-    ctx.fill();
+    function drawBox(bx, by, bww, bhh, lbl, val, sub, accent) {
+      ctx.fillStyle = '#161b22'; ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.roundRect(bx, by, bww, bhh, 5); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = accent || '#30363d';
+      ctx.fillRect(bx, by, bww, 3);
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#8b949e'; ctx.font = '11px monospace';
+      ctx.fillText(lbl, bx + bww / 2, by + 17);
+      ctx.fillStyle = '#e6edf3'; ctx.font = 'bold 19px monospace';
+      ctx.fillText(val, bx + bww / 2, by + 46);
+      ctx.fillStyle = '#6e7681'; ctx.font = '11px monospace';
+      ctx.fillText(sub || '', bx + bww / 2, by + 65);
+    }
 
-    // Footer
-    ctx.fillStyle = '#3a3a5c';
-    ctx.font = '12px monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('github.com/aminsaedi/qr-tunnel', W/2, H - 15);
+    // Row 1: TX total | RX total | Streams | Last data
+    const upSec = s.startTime ? (now - s.startTime) / 1000 : 0;
+    const avgTx = upSec > 5 ? s.txBytes / upSec : 0;
+    const avgRx = upSec > 5 ? s.rxBytes / upSec : 0;
+    const lastDataStr = staleSec < 2 ? 'now' : (staleSec < 60 ? staleSec.toFixed(0) + 's ago' : '>1m ago');
+    const lastDataAccent = staleSec < 5 ? '#238636' : staleSec < 15 ? '#d29922' : '#f85149';
+
+    drawBox(bsX,              boxY1, bw, bh, 'TX TOTAL', fmtBytes(s.txBytes), s.txPkts + ' packets', '#238636');
+    drawBox(bsX+bw+bgap,      boxY1, bw, bh, 'RX TOTAL', fmtBytes(s.rxBytes), s.rxPkts + ' packets', '#1f6feb');
+    drawBox(bsX+2*(bw+bgap),  boxY1, bw, bh, 'STREAMS',  String(s.streams || 0), 'active', '#8957e5');
+    drawBox(bsX+3*(bw+bgap),  boxY1, bw, bh, 'LAST DATA', lastDataStr, staleSec < 2 ? 'data flowing' : 'idle', lastDataAccent);
+
+    // Row 2: Peak TX | Peak RX | Avg TX | Avg RX
+    const boxY2 = boxY1 + bh + bgap;
+    drawBox(bsX,              boxY2, bw, bh, 'PEAK TX',  fmtSpeed(s.peakTx || 0), 'max seen', '#2ea043');
+    drawBox(bsX+bw+bgap,      boxY2, bw, bh, 'PEAK RX',  fmtSpeed(s.peakRx || 0), 'max seen', '#1f6feb');
+    drawBox(bsX+2*(bw+bgap),  boxY2, bw, bh, 'AVG TX',   fmtSpeed(avgTx), 'session avg', '#6e7681');
+    drawBox(bsX+3*(bw+bgap),  boxY2, bw, bh, 'AVG RX',   fmtSpeed(avgRx), 'session avg', '#6e7681');
+
+    // ── Data stall warning banner ──
+    if (staleSec > 12 && s.connected) {
+      const warnY = boxY2 + bh + 12;
+      ctx.fillStyle = 'rgba(218,54,51,0.15)'; ctx.strokeStyle = '#f85149'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.roundRect(40, warnY, W - 80, 30, 4); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#f85149'; ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center';
+      ctx.fillText('⚠  DATA STALL — heartbeat will disconnect at 15s', W / 2, warnY + 20);
+    }
+
+    // ── Pulsing activity dot ──
+    const isActive = s.lastActivity && staleSec < 2;
+    const pulse = isActive ? (0.65 + 0.35 * Math.sin(now / 200)) : 1;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = isActive ? '#3fb950' : (s.connected ? '#d29922' : '#30363d');
+    ctx.beginPath(); ctx.arc(W - 20, 20, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 1;
+
+    // ── Footer ──
+    ctx.fillStyle = '#010409';
+    ctx.fillRect(0, H - 22, W, 22);
+    ctx.fillStyle = '#6e7681'; ctx.font = '11px monospace'; ctx.textAlign = 'center';
+    ctx.fillText('github.com/aminsaedi/qr-tunnel', W / 2, H - 7);
   };
 
   // Hook RTCDataChannel.send to capture LiveKit's _reliable DC send function
@@ -494,6 +617,27 @@ const INIT_SCRIPT = `
 })();
 `;
 
+// Detect whether the user is already logged in to Bale.
+// Returns 'app' (logged in), 'login' (login page), or 'unknown' (ambiguous).
+async function detectLoginState(page) {
+  await sleep(4000); // Let page settle after domcontentloaded
+  try {
+    return await page.evaluate(() => {
+      // Login page has a phone number input
+      if (document.querySelector('input[type="tel"]')) return 'login';
+      if (document.querySelector('input[type="number"]')) return 'login';
+      // Login page: Persian prompts for phone / OTP
+      const text = document.body ? document.body.innerText : '';
+      if (text.includes('شماره موبایل') || text.includes('کد تأیید') || text.includes('ورود به بله')) return 'login';
+      // App: chat sidebar has several data-testid elements
+      if (document.querySelectorAll('[data-testid]').length >= 3) return 'app';
+      return 'unknown';
+    });
+  } catch {
+    return 'unknown';
+  }
+}
+
 async function main() {
   const launchOpts = {
     headless: false,
@@ -532,14 +676,35 @@ async function main() {
 
   console.log('[bridge] Opening Bale...');
   if (role === 'caller') {
-    // Open Bale homepage first — gives time to log in if needed
+    // Open Bale homepage first, then detect login state
     await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded', timeout: 120000 });
-    // Countdown: 60 seconds for login/load, then navigate to chat
-    for (let sec = 60; sec > 0; sec--) {
-      process.stdout.write(`\r[bridge] Navigating to chat in ${sec}s... (log in to Bale if needed) `);
-      await sleep(1000);
+
+    let doWait = forceLoginWait;
+    if (!forceLoginWait) {
+      process.stdout.write('[bridge] Checking login state...\n');
+      const state = await detectLoginState(page);
+      if (state === 'app') {
+        console.log('[bridge] Already logged in — skipping login wait');
+        doWait = false;
+      } else if (state === 'login') {
+        console.log(`[bridge] Login page detected — waiting ${loginWait}s for manual login`);
+        doWait = true;
+      } else {
+        console.log(`[bridge] Login state unclear — waiting ${loginWait}s to be safe`);
+        doWait = true;
+      }
+    } else {
+      console.log(`[bridge] --force-login-wait: waiting ${loginWait}s`);
     }
-    process.stdout.write('\r[bridge] Navigating to chat...                                      \n');
+
+    if (doWait) {
+      for (let sec = loginWait; sec > 0; sec--) {
+        process.stdout.write(`\r[bridge] Navigating to chat in ${sec}s... (log in to Bale if needed) `);
+        await sleep(1000);
+      }
+      process.stdout.write('\r[bridge] Navigating to chat...                                      \n');
+    }
+
     await page.goto(`https://web.bale.ai/chat?uid=${targetUser}`, { waitUntil: 'domcontentloaded', timeout: 120000 });
   } else {
     await page.goto('https://web.bale.ai/', { waitUntil: 'domcontentloaded', timeout: 120000 });
@@ -621,32 +786,43 @@ async function main() {
   }, 10000);
 
   // Poll for DataChannel receive queue (remote DC → Go)
-  // We poll at high frequency to minimize latency
-  setInterval(async () => {
-    if (!goSocket || goSocket.readyState !== 1 || !page) return;
-    try {
-      const messages = await page.evaluate(() => {
-        if (!window.__dcRecvQueue || window.__dcRecvQueue.length === 0) return null;
-        const msgs = window.__dcRecvQueue;
-        window.__dcRecvQueue = [];
-        // Update RX stats in the same evaluate call (no extra round-trip)
-        let bytes = 0;
-        for (const m of msgs) bytes += m.length;
-        const s = window.__tunnelStats;
-        if (s) { s.rxBytes += bytes; s.rxPkts += msgs.length; s.connected = true; s.mode = 'datachannel'; if (!s.startTime) s.startTime = Date.now(); s.lastActivity = Date.now(); }
-        return msgs;
-      });
-      if (messages && messages.length > 0) {
-        for (const msg of messages) {
-          sendDCToGo(Buffer.from(msg));
-          dcRxCount++;
-        }
-        if (dcRxCount % 100 < messages.length) {
-          console.log(`[DC-rx] total=${dcRxCount}, batch=${messages.length}`);
-        }
+  // Uses sequential async loop to avoid piling up page.evaluate calls
+  async function dcPollLoop() {
+    while (true) {
+      if (!goSocket || goSocket.readyState !== 1 || !page) {
+        await sleep(10);
+        continue;
       }
-    } catch {}
-  }, 10); // 10ms polling — low latency for DataChannel data
+      try {
+        const messages = await page.evaluate(() => {
+          if (!window.__dcRecvQueue || window.__dcRecvQueue.length === 0) return null;
+          const msgs = window.__dcRecvQueue;
+          window.__dcRecvQueue = [];
+          // Update RX stats — msgs are base64 strings, estimate real bytes
+          let bytes = 0;
+          for (const m of msgs) bytes += Math.floor(m.length * 3 / 4);
+          const s = window.__tunnelStats;
+          if (s) { s.rxBytes += bytes; s.rxPkts += msgs.length; s.connected = true; s.mode = 'datachannel'; if (!s.startTime) s.startTime = Date.now(); s.lastActivity = Date.now(); }
+          return msgs;
+        });
+        if (messages && messages.length > 0) {
+          for (const msg of messages) {
+            sendDCToGo(msg); // msg is already base64, sendDCToGo handles decoding
+            dcRxCount++;
+          }
+          if (dcRxCount % 100 < messages.length) {
+            console.log(`[DC-rx] total=${dcRxCount}, batch=${messages.length}`);
+          }
+          await sleep(1); // brief yield, then poll again immediately (data was flowing)
+        } else {
+          await sleep(5); // no data, back off slightly
+        }
+      } catch {
+        await sleep(10);
+      }
+    }
+  }
+  dcPollLoop(); // fire-and-forget — runs until process exits
 
   process.on('SIGINT', async () => { wss.close(); await context.close(); process.exit(0); });
   await new Promise(() => {});
@@ -907,7 +1083,7 @@ async function setupDCReceiver(pg) {
               payload = window.__extractLKPayload ? window.__extractLKPayload(arr) : null;
             }
             if (payload && payload.length > 0) {
-              window.__dcRecvQueue.push(Array.from(payload));
+              window.__dcRecvQueue.push(window.__u8toB64(payload));
             }
           }
         });

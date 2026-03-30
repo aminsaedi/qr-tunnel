@@ -3,7 +3,6 @@ package transport
 import (
 	"bytes"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"log"
 	"sync"
@@ -95,8 +94,12 @@ func (s *Stream) Write(data []byte) (int, error) {
 	}
 
 	// Fragment into chunks
-	maxPayload := s.transport.config.BitmapConfig.MaxPayloadBytes()
-	maxChunk := maxPayload - 19 // subtract transport header size
+	maxChunk := s.transport.config.BitmapConfig.MaxPayloadBytes() - transportHeaderSize
+	// In DataChannel mode, use much larger chunks — DC handles 64KB+ per message.
+	// Bitmap's 221-byte limit is irrelevant; bigger chunks = fewer frames = less overhead.
+	if s.transport.sendDataDirect != nil {
+		maxChunk = 16 * 1024 // 16KB per chunk
+	}
 	if maxChunk < 50 {
 		maxChunk = 50
 	}
@@ -189,14 +192,16 @@ func (s *Stream) handleData(seqNum uint32, data []byte) {
 	s.recvMu.Lock()
 	defer s.recvMu.Unlock()
 
-	dataHash := crc32.ChecksumIEEE(data)
-	log.Printf("[stream] handleData: stream=%d seq=%d data=%d bytes hash=%08x recvNext=%d", s.ID, seqNum, len(data), dataHash, s.recvNext)
+	// Reduce hot-path logging — only log first segment and out-of-order
+	if seqNum == 1 || seqNum != s.recvNext {
+		log.Printf("[stream] handleData: stream=%d seq=%d data=%d bytes recvNext=%d", s.ID, seqNum, len(data), s.recvNext)
+	}
 
 	s.lastRecv.Store(time.Now().UnixNano())
 	s.ackPending++
-	// Batch ACKs: send after every 4 DATA frames to reduce ACK overhead.
-	// Each ACK is 19 bytes in a ~960 byte frame — wasteful if sent alone.
-	if s.ackPending >= 4 {
+	// ACK every 8 frames or when we've received 32KB+ since last ACK.
+	// In DC mode with 16KB chunks, 8 frames = 128KB — aggressive enough.
+	if s.ackPending >= 8 {
 		s.needsAck = true
 		s.ackPending = 0
 	}
