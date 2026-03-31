@@ -287,17 +287,14 @@ const INIT_SCRIPT = `
     const now = Date.now();
 
     // ── Background ──
-    // ── Animated gradient background ──
-    // VP9 aggressively downscales static content. This animated gradient ensures
-    // every pixel changes slightly per frame, preventing 720→180 downscale.
-    const bgGrad = ctx.createLinearGradient(0, 0, W, H);
-    const t = now / 3000;
-    bgGrad.addColorStop(0, 'hsl(' + ((t * 30) % 360) + ', 15%, 6%)');
-    bgGrad.addColorStop(0.3, 'hsl(' + ((t * 30 + 60) % 360) + ', 10%, 8%)');
-    bgGrad.addColorStop(0.6, 'hsl(' + ((t * 30 + 120) % 360) + ', 12%, 7%)');
-    bgGrad.addColorStop(1, 'hsl(' + ((t * 30 + 200) % 360) + ', 15%, 5%)');
-    ctx.fillStyle = bgGrad;
+    // ── Background ── (solid fill + scattered random rects for VP9 entropy)
+    ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, W, H);
+    // Scatter random dark patches — cheap but changes every frame
+    for (let i = 0; i < 15; i++) {
+      ctx.fillStyle = 'rgb(' + ((Math.random()*18+5)|0) + ',' + ((Math.random()*18+5)|0) + ',' + ((Math.random()*25+8)|0) + ')';
+      ctx.fillRect(Math.random()*W|0, Math.random()*H|0, 40+(Math.random()*80|0), 25+(Math.random()*50|0));
+    }
 
     // ── Helpers ──
     function fmtBytes(b) {
@@ -332,12 +329,11 @@ const INIT_SCRIPT = `
     }
     const staleSec = s.lastActivity ? (now - s.lastActivity) / 1000 : 999;
 
-    // ── Animated rainbow wave bar ── (continuous per-frame motion prevents VP9 downscale)
-    for (let x = 0; x < W; x += 2) {
-      const hue = (x * 0.5 + now * 0.08) % 360;
-      const h = 4 + Math.sin(x / 25 + now / 200) * 2;
-      ctx.fillStyle = 'hsl(' + hue + ',' + (s.connected ? 65 : 30) + '%,' + (s.connected ? 35 : 20) + '%)';
-      ctx.fillRect(x, 0, 2, h);
+    // ── Animated color bar at top ── (8px blocks, moves with time)
+    for (let x = 0; x < W; x += 8) {
+      const hue = (x * 0.3 + now * 0.05) % 360;
+      ctx.fillStyle = 'hsl(' + hue + ',' + (s.connected ? 60 : 25) + '%,' + (s.connected ? 30 : 15) + '%)';
+      ctx.fillRect(x, 0, 8, 5);
     }
 
     // ── HEADER: Title + mode badge + status + uptime ──
@@ -486,76 +482,36 @@ const INIT_SCRIPT = `
     ctx.globalAlpha = 1;
 
     // ══════════════════════════════════════════════════════════════
-    // ── ANTI-VP9 DOWNSCALE: Heavy visual motion ──
-    // VP9 + SFU aggressively reduce resolution when content is static.
-    // These animations ensure every frame differs significantly.
+    // ── ANTI-VP9 DOWNSCALE ──
+    // Must be lightweight! Heavy drawing blocks Chrome's JS main thread
+    // which prevents DC message forwarding → heartbeat dies.
+    // Strategy: cheap ops that change many pixels per frame.
     // ══════════════════════════════════════════════════════════════
 
-    // 1. Floating particles (20 particles moving across screen)
-    if (!s._particles) {
-      s._particles = [];
-      for (let i = 0; i < 25; i++) {
-        s._particles.push({
-          x: Math.random() * W, y: Math.random() * H,
-          vx: (Math.random() - 0.5) * 3, vy: (Math.random() - 0.5) * 2,
-          r: Math.random() * 3 + 1, hue: Math.random() * 360
-        });
-      }
-    }
-    for (const p of s._particles) {
-      p.x += p.vx; p.y += p.vy; p.hue = (p.hue + 0.5) % 360;
-      if (p.x < 0 || p.x > W) p.vx *= -1;
-      if (p.y < 0 || p.y > H) p.vy *= -1;
-      ctx.globalAlpha = 0.4;
-      ctx.fillStyle = 'hsl(' + p.hue + ',70%,50%)';
-      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-
-    // 2. Sine wave across bottom (continuous motion)
-    const waveBase = H - 55;
-    ctx.strokeStyle = 'hsl(' + ((now / 20) % 360) + ',60%,40%)';
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    for (let x = 0; x < W; x += 3) {
-      const y = waveBase + Math.sin(x / 40 + now / 300) * 8 + Math.sin(x / 15 + now / 150) * 4;
-      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // Second wave
-    ctx.strokeStyle = 'hsl(' + ((now / 20 + 120) % 360) + ',50%,35%)';
-    ctx.beginPath();
-    for (let x = 0; x < W; x += 3) {
-      const y = waveBase + Math.sin(x / 30 - now / 250) * 6 + Math.cos(x / 20 + now / 180) * 5;
-      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-
-    // 3. Large noise strip (full width, 25px tall)
-    const noiseY = H - 45;
-    for (let x = 0; x < W; x += 3) {
+    // 1. Noise strip (8px blocks = fast, full width, changes every frame)
+    const noiseY = H - 48;
+    for (let x = 0; x < W; x += 8) {
       ctx.fillStyle = 'rgb(' + ((Math.random()*50+10)|0) + ',' + ((Math.random()*40+10)|0) + ',' + ((Math.random()*60+15)|0) + ')';
-      ctx.fillRect(x, noiseY, 3, 18);
+      ctx.fillRect(x, noiseY, 8, 20);
     }
 
-    // 4. Side noise columns (left and right edges, subtle but changes every frame)
-    for (let y = 0; y < H; y += 6) {
+    // 2. Edge noise (left + right columns, changes every frame)
+    for (let y = 0; y < H; y += 8) {
       ctx.fillStyle = 'rgb(' + ((Math.random()*30+8)|0) + ',' + ((Math.random()*25+8)|0) + ',' + ((Math.random()*40+12)|0) + ')';
-      ctx.fillRect(0, y, 8, 6);
-      ctx.fillRect(W - 8, y, 8, 6);
+      ctx.fillRect(0, y, 6, 8);
+      ctx.fillRect(W - 6, y, 6, 8);
     }
 
-    // 5. Scrolling ticker
-    const tickerY = noiseY + 20;
+    // 3. Scrolling ticker (one fillText, cheap but moves every frame)
+    const tickerY = noiseY + 22;
     ctx.fillStyle = '#0a0d12';
     ctx.fillRect(0, tickerY, W, 14);
     ctx.fillStyle = '#4a5060'; ctx.font = '11px monospace'; ctx.textAlign = 'left';
     const tickText = '  ●  QR-TUNNEL  ●  DataChannel proxy via Bale  ●  SOCKS5 :1080  ●  HTTP :8080  ●  aminsaedi/qr-tunnel  ';
-    const tickOffset = -(now / 25) % (tickText.length * 6.6);
-    ctx.fillText(tickText + tickText, tickOffset, tickerY + 11);
+    const tickOff = -(now / 25) % (tickText.length * 6.6);
+    ctx.fillText(tickText + tickText, tickOff, tickerY + 11);
 
-    // 6. Footer with frame counter + clock
+    // 4. Footer with frame counter + clock
     ctx.fillStyle = '#010409';
     ctx.fillRect(0, H - 12, W, 12);
     ctx.fillStyle = '#4a4f5a'; ctx.font = '10px monospace';
@@ -620,16 +576,11 @@ const INIT_SCRIPT = `
           window.__frameN++;
           const ctx = window.__qrCtx;
 
-          // Always draw stats dashboard on the canvas
-          window.__drawTunnelStats(ctx, videoFrame);
-
-          // Create new VideoFrame from canvas
-          const newFrame = new VideoFrame(window.__qrCanvas, {
-            timestamp: videoFrame.timestamp,
-            alpha: 'discard',
-          });
-          videoFrame.close();
-          controller.enqueue(newFrame);
+          // Pass through the fake camera feed directly — testsrc2 is already
+          // animated (color bars, clock) which prevents VP9 downscale.
+          // Drawing on canvas at 1280x720 blocks the main thread and kills DC.
+          // Stats are shown as HTML overlay instead.
+          controller.enqueue(videoFrame);
         }
       });
 
@@ -802,13 +753,34 @@ async function main() {
   }
   await sleep(10000);
 
-  // Label
+  // Label + stats overlay (HTML-based, doesn't affect video pipeline)
   const color = role === 'caller' ? '#e74c3c' : '#2ecc71';
   const label = role === 'caller' ? `CALLER → ${targetUser}` : 'SERVER (auto-answer)';
   await page.evaluate(({c,l}) => {
     const d = document.createElement('div');
     d.textContent = l; d.style.cssText = `position:fixed;top:0;left:0;right:0;z-index:999999;background:${c};color:#fff;text-align:center;font:bold 15px sans-serif;padding:3px 0;pointer-events:none;opacity:0.85;`;
     document.body.appendChild(d);
+
+    // Stats overlay panel
+    const panel = document.createElement('div');
+    panel.id = 'tunnel-stats';
+    panel.style.cssText = 'position:fixed;bottom:5px;left:5px;z-index:999999;background:rgba(0,0,0,0.8);color:#e6edf3;font:12px monospace;padding:8px 12px;border-radius:6px;pointer-events:none;max-width:300px;';
+    panel.innerHTML = 'Tunnel: waiting...';
+    document.body.appendChild(panel);
+
+    // Update stats overlay every second
+    setInterval(() => {
+      const s = window.__tunnelStats;
+      if (!s) return;
+      function fmt(b) { return b < 1024 ? b + 'B' : b < 1048576 ? (b/1024).toFixed(1) + 'KB' : (b/1048576).toFixed(1) + 'MB'; }
+      function spd(b) { return b < 1024 ? b.toFixed(0) + 'B/s' : (b/1024).toFixed(1) + 'KB/s'; }
+      const up = s.startTime ? Math.floor((Date.now() - s.startTime) / 1000) : 0;
+      panel.innerHTML = (s.connected ? '● CONNECTED' : '○ ' + s.mode) +
+        ' | ↑' + fmt(s.txBytes) + ' ↓' + fmt(s.rxBytes) +
+        '<br>Speed: ↑' + spd(s._txSpeed||0) + ' ↓' + spd(s._rxSpeed||0) +
+        ' | Streams: ' + (s.streams||0) +
+        '<br>Uptime: ' + Math.floor(up/60) + 'm' + (up%60) + 's | F:' + (window.__frameN||0);
+    }, 1000);
   }, {c:color,l:label});
 
   if (role === 'caller') {
@@ -824,57 +796,20 @@ async function main() {
   // (init script hooks may miss LiveKit's PeerConnections that load before our hooks)
   await setupDCReceiver(page);
 
-  // Log DataChannel state + probe for LiveKit SDK every 10 seconds
-  setInterval(async () => {
+  // Log DC state once at startup (avoid repeated page.evaluate that competes with DC)
+  setTimeout(async () => {
     try {
       const info = await page.evaluate(() => {
         const dcState = (window.__dcAll || []).map(d => ({
           label: d.label, dir: d.dir, state: d.dc.readyState
         }));
-
-        // Probe for LiveKit SDK objects (DataPacket, Room, etc.)
-        let lkFound = [];
-        // Search all script-accessible globals and module caches
-        function searchObj(obj, path, depth) {
-          if (depth > 3 || !obj || typeof obj !== 'object') return;
-          try {
-            for (const key of Object.getOwnPropertyNames(obj).slice(0, 100)) {
-              try {
-                const v = obj[key];
-                if (typeof v === 'function' && (key === 'DataPacket' || key === 'UserPacket')) {
-                  lkFound.push(path + '.' + key);
-                }
-                if (v && typeof v === 'object' && v.localParticipant && typeof v.localParticipant.publishData === 'function') {
-                  lkFound.push(path + '.' + key + ' (Room with publishData!)');
-                }
-                if (v && typeof v === 'function' && v.name === 'Room' && v.prototype?.localParticipant !== undefined) {
-                  lkFound.push(path + '.' + key + ' (Room constructor)');
-                }
-              } catch(e) {}
-            }
-          } catch(e) {}
-        }
-        searchObj(window, 'window', 0);
-        // Check webpack chunks
-        try {
-          const chunks = window.webpackChunk || window.webpackChunkbale_web || window.webpackChunk_N_E || [];
-          lkFound.push('webpackChunks: ' + chunks.length);
-        } catch(e) {}
-
-        // Check for __lkSendDC (send hook)
         const sendDC = window.__lkSendDC ? 'captured' : 'null';
-
-        return { dcState, lkFound, sendDC, dcSeq: window.__dcSeq || 0 };
+        return { dcState, sendDC, dcSeq: window.__dcSeq || 0 };
       });
-      if (info.dcState.length > 0) {
-        console.log('[DC-state]', JSON.stringify(info.dcState));
-      }
-      if (info.lkFound.length > 0) {
-        console.log('[LK-probe]', JSON.stringify(info.lkFound));
-      }
-      console.log(`[DC-info] sendDC=${info.sendDC} dcSeq=${info.dcSeq}`);
+      console.log('[DC-state]', JSON.stringify(info.dcState));
+      console.log('[DC-info] sendDC=' + info.sendDC + ' dcSeq=' + info.dcSeq);
     } catch {}
-  }, 10000);
+  }, 5000);
 
   // Poll for DataChannel receive queue (remote DC → Go)
   // Uses sequential async loop to avoid piling up page.evaluate calls
@@ -1236,6 +1171,11 @@ async function setupDCReceiver(pg) {
 
 function startCapture(page) {
   let seq = 0, ok = 0, err = 0, consecutiveEmpty = 0;
+  // Skip video frame capture — all data goes through DataChannel now.
+  // Frame capture at 20fps wastes CPU + page.evaluate calls that compete with DC forwarding.
+  // Only needed for legacy bitmap mode which is no longer used.
+  console.log('[bridge] Skipping video frame capture (DC mode — not needed)');
+  return;
   setInterval(async () => {
     if (!goSocket || goSocket.readyState !== 1) return;
     try {
