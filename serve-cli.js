@@ -69,7 +69,7 @@ if (!fs.existsSync(fakeCam)) {
   console.log('Creating fake camera file...');
   const { execSync } = require('child_process');
   try {
-    execSync(`ffmpeg -y -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 120 -pix_fmt yuv420p ${fakeCam} 2>/dev/null`);
+    execSync(`ffmpeg -y -f lavfi -i "testsrc2=size=1280x720:rate=5" -t 10 -pix_fmt yuv420p ${fakeCam} 2>/dev/null`);
   } catch {}
 }
 
