@@ -69,7 +69,7 @@ if (!fs.existsSync(fakeCam)) {
   console.log('Creating fake camera file...');
   const { execSync } = require('child_process');
   try {
-    execSync(`ffmpeg -y -f lavfi -i "color=c=gray:s=720x720:r=30" -t 120 -pix_fmt yuv420p ${fakeCam} 2>/dev/null`);
+    execSync(`ffmpeg -y -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 120 -pix_fmt yuv420p ${fakeCam} 2>/dev/null`);
   } catch {}
 }
 
@@ -204,6 +204,9 @@ let sessionActive = false; // true when bridge+tunnel are running
 function killSession() {
   if (tunnelProc) { try { tunnelProc.kill(); } catch {} tunnelProc = null; }
   if (bridgeProc) { try { bridgeProc.kill(); } catch {} bridgeProc = null; }
+  // Kill orphan Chrome spawned by bridge (Playwright doesn't always clean up on crash)
+  try { execSync('pkill -f "chrome.*profile-b" 2>/dev/null || true'); } catch {}
+  try { execSync('pkill -f "Google Chrome.*profile-b" 2>/dev/null || true'); } catch {}
   sessionActive = false;
 }
 

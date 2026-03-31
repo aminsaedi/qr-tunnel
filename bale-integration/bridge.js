@@ -17,7 +17,10 @@ const loginWait = parseInt(args.find((_, i, a) => a[i - 1] === '--login-wait') |
 // Force login wait: always show countdown even if already logged in
 const forceLoginWait = args.includes('--force-login-wait');
 const FPS = 20; // Higher capture rate for bitmap codec
-const FAKE_CAMERA = '/tmp/qr-fake-camera.y4m';
+const FAKE_CAMERA = process.platform === 'win32'
+  ? path.join(process.env.TEMP || 'C:\\Windows\\Temp', 'qr-fake-camera.y4m')
+  : '/tmp/qr-fake-camera.y4m';
+const CANVAS_W = 1280, CANVAS_H = 720; // 16:9 real webcam ratio — prevents SFU downscale
 
 console.log(`[bridge] role=${role} target=${targetUser} ws=${wsPort} autoAnswer=${autoAnswer}`);
 
@@ -55,7 +58,7 @@ wss.on('connection', ws => {
 function sendToGo(jpegBuf, seq) {
   if (!goSocket || goSocket.readyState !== 1) return;
   const hdr = Buffer.alloc(8);
-  hdr.writeUInt32BE(seq, 0); hdr.writeUInt16BE(720, 4); hdr.writeUInt16BE(720, 6);
+  hdr.writeUInt32BE(seq, 0); hdr.writeUInt16BE(1280, 4); hdr.writeUInt16BE(720, 6);
   try { goSocket.send(Buffer.concat([hdr, jpegBuf])); } catch {}
 }
 
@@ -279,12 +282,21 @@ const INIT_SCRIPT = `
 
   // Stats dashboard renderer — shown as the local camera feed during the call
   window.__drawTunnelStats = function(ctx, videoOrFrame) {
-    const W = 720, H = 720;
+    const W = 1280, H = 720;
     const s = window.__tunnelStats;
     const now = Date.now();
 
     // ── Background ──
-    ctx.fillStyle = '#0d1117';
+    // ── Animated gradient background ──
+    // VP9 aggressively downscales static content. This animated gradient ensures
+    // every pixel changes slightly per frame, preventing 720→180 downscale.
+    const bgGrad = ctx.createLinearGradient(0, 0, W, H);
+    const t = now / 3000;
+    bgGrad.addColorStop(0, 'hsl(' + ((t * 30) % 360) + ', 15%, 6%)');
+    bgGrad.addColorStop(0.3, 'hsl(' + ((t * 30 + 60) % 360) + ', 10%, 8%)');
+    bgGrad.addColorStop(0.6, 'hsl(' + ((t * 30 + 120) % 360) + ', 12%, 7%)');
+    bgGrad.addColorStop(1, 'hsl(' + ((t * 30 + 200) % 360) + ', 15%, 5%)');
+    ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, W, H);
 
     // ── Helpers ──
@@ -312,20 +324,21 @@ const INIT_SCRIPT = `
       s._rxSpeed = Math.max(0, (s.rxBytes - s._lastRx) / dt);
       s._lastTx = s.txBytes; s._lastRx = s.rxBytes; s._lastCheck = now;
       s._histIdx = ((s._histIdx || 0) + 1) % 60;
-      s.txHistory[s._histIdx] = s._txSpeed;
-      s.rxHistory[s._histIdx] = s._rxSpeed;
+      // Add baseline noise when idle — keeps sparklines animated to prevent VP9 downscale
+      s.txHistory[s._histIdx] = s._txSpeed > 0 ? s._txSpeed : Math.random() * 200;
+      s.rxHistory[s._histIdx] = s._rxSpeed > 0 ? s._rxSpeed : Math.random() * 200;
       s.peakTx = Math.max(s.peakTx || 0, s._txSpeed);
       s.peakRx = Math.max(s.peakRx || 0, s._rxSpeed);
     }
     const staleSec = s.lastActivity ? (now - s.lastActivity) / 1000 : 999;
 
-    // ── Top gradient accent bar ──
-    const grad = ctx.createLinearGradient(0, 0, W, 0);
-    grad.addColorStop(0, '#161b22');
-    grad.addColorStop(0.5, s.connected ? '#238636' : '#da3633');
-    grad.addColorStop(1, '#161b22');
-    ctx.fillStyle = grad;
-    ctx.fillRect(0, 0, W, 5);
+    // ── Animated rainbow wave bar ── (continuous per-frame motion prevents VP9 downscale)
+    for (let x = 0; x < W; x += 2) {
+      const hue = (x * 0.5 + now * 0.08) % 360;
+      const h = 4 + Math.sin(x / 25 + now / 200) * 2;
+      ctx.fillStyle = 'hsl(' + hue + ',' + (s.connected ? 65 : 30) + '%,' + (s.connected ? 35 : 20) + '%)';
+      ctx.fillRect(x, 0, 2, h);
+    }
 
     // ── HEADER: Title + mode badge + status + uptime ──
     ctx.textAlign = 'center';
@@ -469,14 +482,91 @@ const INIT_SCRIPT = `
     const pulse = isActive ? (0.65 + 0.35 * Math.sin(now / 200)) : 1;
     ctx.globalAlpha = pulse;
     ctx.fillStyle = isActive ? '#3fb950' : (s.connected ? '#d29922' : '#30363d');
-    ctx.beginPath(); ctx.arc(W - 20, 20, 7, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(W - 25, 25, 8, 0, Math.PI * 2); ctx.fill();
     ctx.globalAlpha = 1;
 
-    // ── Footer ──
+    // ══════════════════════════════════════════════════════════════
+    // ── ANTI-VP9 DOWNSCALE: Heavy visual motion ──
+    // VP9 + SFU aggressively reduce resolution when content is static.
+    // These animations ensure every frame differs significantly.
+    // ══════════════════════════════════════════════════════════════
+
+    // 1. Floating particles (20 particles moving across screen)
+    if (!s._particles) {
+      s._particles = [];
+      for (let i = 0; i < 25; i++) {
+        s._particles.push({
+          x: Math.random() * W, y: Math.random() * H,
+          vx: (Math.random() - 0.5) * 3, vy: (Math.random() - 0.5) * 2,
+          r: Math.random() * 3 + 1, hue: Math.random() * 360
+        });
+      }
+    }
+    for (const p of s._particles) {
+      p.x += p.vx; p.y += p.vy; p.hue = (p.hue + 0.5) % 360;
+      if (p.x < 0 || p.x > W) p.vx *= -1;
+      if (p.y < 0 || p.y > H) p.vy *= -1;
+      ctx.globalAlpha = 0.4;
+      ctx.fillStyle = 'hsl(' + p.hue + ',70%,50%)';
+      ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+
+    // 2. Sine wave across bottom (continuous motion)
+    const waveBase = H - 55;
+    ctx.strokeStyle = 'hsl(' + ((now / 20) % 360) + ',60%,40%)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    for (let x = 0; x < W; x += 3) {
+      const y = waveBase + Math.sin(x / 40 + now / 300) * 8 + Math.sin(x / 15 + now / 150) * 4;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // Second wave
+    ctx.strokeStyle = 'hsl(' + ((now / 20 + 120) % 360) + ',50%,35%)';
+    ctx.beginPath();
+    for (let x = 0; x < W; x += 3) {
+      const y = waveBase + Math.sin(x / 30 - now / 250) * 6 + Math.cos(x / 20 + now / 180) * 5;
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+
+    // 3. Large noise strip (full width, 25px tall)
+    const noiseY = H - 45;
+    for (let x = 0; x < W; x += 3) {
+      ctx.fillStyle = 'rgb(' + ((Math.random()*50+10)|0) + ',' + ((Math.random()*40+10)|0) + ',' + ((Math.random()*60+15)|0) + ')';
+      ctx.fillRect(x, noiseY, 3, 18);
+    }
+
+    // 4. Side noise columns (left and right edges, subtle but changes every frame)
+    for (let y = 0; y < H; y += 6) {
+      ctx.fillStyle = 'rgb(' + ((Math.random()*30+8)|0) + ',' + ((Math.random()*25+8)|0) + ',' + ((Math.random()*40+12)|0) + ')';
+      ctx.fillRect(0, y, 8, 6);
+      ctx.fillRect(W - 8, y, 8, 6);
+    }
+
+    // 5. Scrolling ticker
+    const tickerY = noiseY + 20;
+    ctx.fillStyle = '#0a0d12';
+    ctx.fillRect(0, tickerY, W, 14);
+    ctx.fillStyle = '#4a5060'; ctx.font = '11px monospace'; ctx.textAlign = 'left';
+    const tickText = '  ●  QR-TUNNEL  ●  DataChannel proxy via Bale  ●  SOCKS5 :1080  ●  HTTP :8080  ●  aminsaedi/qr-tunnel  ';
+    const tickOffset = -(now / 25) % (tickText.length * 6.6);
+    ctx.fillText(tickText + tickText, tickOffset, tickerY + 11);
+
+    // 6. Footer with frame counter + clock
     ctx.fillStyle = '#010409';
-    ctx.fillRect(0, H - 22, W, 22);
-    ctx.fillStyle = '#6e7681'; ctx.font = '11px monospace'; ctx.textAlign = 'center';
-    ctx.fillText('github.com/aminsaedi/qr-tunnel', W / 2, H - 7);
+    ctx.fillRect(0, H - 12, W, 12);
+    ctx.fillStyle = '#4a4f5a'; ctx.font = '10px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(' F:' + (window.__frameN || 0), 2, H - 2);
+    ctx.textAlign = 'center';
+    ctx.fillText('qr-tunnel v5', W / 2, H - 2);
+    ctx.textAlign = 'right';
+    const sec = Math.floor(now / 1000) % 60;
+    const min = Math.floor(now / 60000) % 60;
+    ctx.fillText((min < 10 ? '0' : '') + min + ':' + (sec < 10 ? '0' : '') + sec, W - 3, H - 2);
   };
 
   // Hook RTCDataChannel.send to capture LiveKit's _reliable DC send function
@@ -510,7 +600,7 @@ const INIT_SCRIPT = `
     // Create canvas for drawing
     if (!window.__qrCanvas) {
       const c = document.createElement('canvas');
-      c.width = 720; c.height = 720;
+      c.width = 1280; c.height = 720;
       c.style.cssText = 'position:fixed;bottom:5px;right:5px;width:100px;height:100px;z-index:999999;border:2px solid lime;';
       document.body?.appendChild(c);
       window.__qrCanvas = c;
@@ -546,9 +636,9 @@ const INIT_SCRIPT = `
       processor.readable.pipeThrough(transformer).pipeTo(generator.writable);
 
       // Build output stream: transformed video + real audio
-      // Set contentHint to 'detail' — tells VP9 to use screen-content mode
-      // which preserves sharp block edges much better than camera mode
-      generator.contentHint = 'detail';
+      // Don't set contentHint='detail' — that triggers VP9 screen-share mode
+      // which aggressively downscales when content appears static.
+      // Leave unset so encoder treats it as normal camera feed.
 
       const outputStream = new MediaStream();
       outputStream.addTrack(generator);
@@ -606,11 +696,11 @@ const INIT_SCRIPT = `
     if (!v) return null;
     if (!window.__captureCtx) {
       window.__captureCanvas = document.createElement('canvas');
-      window.__captureCanvas.width = 720; window.__captureCanvas.height = 720;
+      window.__captureCanvas.width = 1280; window.__captureCanvas.height = 720;
       window.__captureCtx = window.__captureCanvas.getContext('2d');
     }
     try {
-      window.__captureCtx.drawImage(v, 0, 0, 720, 720);
+      window.__captureCtx.drawImage(v, 0, 0, 1280, 720);
       return { dataUrl: window.__captureCanvas.toDataURL('image/png'), vw: v.videoWidth, vh: v.videoHeight };
     } catch(e) { return { error: e.message }; }
   };
@@ -651,9 +741,10 @@ async function main() {
     permissions: ['camera', 'microphone'],
     ignoreHTTPSErrors: true,
   };
-  // Use system Chrome if set (avoids needing Playwright's bundled Chromium)
-  if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH) {
-    launchOpts.executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  // Use system Chrome — CLI flag takes priority, then env var
+  const chromePath = args.find((_, i, a) => a[i - 1] === '--chrome') || process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
+  if (chromePath) {
+    launchOpts.executablePath = chromePath;
   }
   const context = await chromium.launchPersistentContext(profileDir, launchOpts);
 
@@ -824,7 +915,9 @@ async function main() {
   }
   dcPollLoop(); // fire-and-forget — runs until process exits
 
-  process.on('SIGINT', async () => { wss.close(); await context.close(); process.exit(0); });
+  async function shutdown() { try { wss.close(); } catch {} try { await context.close(); } catch {} process.exit(0); }
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
   await new Promise(() => {});
 }
 

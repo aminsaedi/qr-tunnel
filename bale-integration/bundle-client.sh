@@ -80,7 +80,7 @@ echo "Node.js: $(node --version)"
 FAKE_CAM="/tmp/qr-fake-camera.y4m"
 if [ ! -f "$FAKE_CAM" ]; then
   echo "Creating fake camera file..."
-  "$SCRIPT_DIR/bin/ffmpeg" -y -f lavfi -i "color=c=gray:s=720x720:r=30" -t 120 -pix_fmt yuv420p "$FAKE_CAM" 2>/dev/null
+  "$SCRIPT_DIR/bin/ffmpeg" -y -f lavfi -i "testsrc2=size=1280x720:rate=30" -t 120 -pix_fmt yuv420p "$FAKE_CAM" 2>/dev/null
 fi
 
 chmod +x "$SCRIPT_DIR/qr-tunnel"
