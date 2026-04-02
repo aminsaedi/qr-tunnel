@@ -687,6 +687,8 @@ async function main() {
       '--disable-web-security', '--disable-site-isolation-trials',
       '--use-fake-device-for-media-stream', `--use-file-for-fake-video-capture=${FAKE_CAMERA}`,
       '--enable-blink-features=MediaStreamInsertableStreams',
+      '--disable-extensions', '--disable-background-networking',
+      '--disable-component-update', '--disable-default-apps',
     ],
     viewport: { width: 1280, height: 800 },
     permissions: ['camera', 'microphone'],
@@ -697,9 +699,20 @@ async function main() {
   if (chromePath) {
     launchOpts.executablePath = chromePath;
   }
+  console.log(`[bridge] Launching Chrome: ${launchOpts.executablePath || 'bundled'}`);
+  console.log(`[bridge] Profile: ${profileDir}`);
+  console.log(`[bridge] Fake camera: ${FAKE_CAMERA}`);
   const context = await chromium.launchPersistentContext(profileDir, launchOpts);
 
+  // Detect Chrome crash/close immediately
+  context.on('close', () => {
+    console.error('[bridge] FATAL: Chrome closed unexpectedly');
+    process.exit(1);
+  });
+
   page = context.pages()[0] || await context.newPage();
+  page.on('crash', () => console.error('[bridge] FATAL: page crashed'));
+  page.on('pageerror', e => console.error('[bridge] Page error:', e.message));
   await page.addInitScript(INIT_SCRIPT);
 
   // Inject LiveKit protocol bundle for correct DataPacket serialization

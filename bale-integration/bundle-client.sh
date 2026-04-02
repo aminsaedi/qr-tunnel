@@ -165,7 +165,10 @@ while [ "$STOPPED" = "false" ]; do
 
   # Wait for either process to exit
   # bridge dies = call ended / nav failed; tunnel dies = heartbeat killed it
-  wait -n $BRIDGE_PID $TUNNEL_PID 2>/dev/null || true
+  # Note: can't use `wait -n` — requires bash 4.3+ but macOS ships with 3.2
+  while kill -0 $BRIDGE_PID 2>/dev/null && kill -0 $TUNNEL_PID 2>/dev/null; do
+    sleep 1
+  done
 
   # Clean up this session
   kill $TUNNEL_PID 2>/dev/null || true
